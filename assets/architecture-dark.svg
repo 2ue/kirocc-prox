@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1080" role="img" aria-label="kirocc-pro architecture: request and response conversion pipelines with fork fix insertion points.">
+  <title>kirocc-pro architecture</title>
+  <desc>Processing pipeline from Claude Code through middleware, handler, request conversion, Kiro API, response conversion, and back. Eight fork fix markers indicate where the fork modifies the upstream behavior.</desc>
+
+  <defs>
+    <marker id="arrow-ink-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#F2EFEA"/>
+    </marker>
+    <marker id="arrow-muted-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9D9388"/>
+    </marker>
+    <marker id="arrow-accent-d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#DD8E5C"/>
+    </marker>
+  </defs>
+
+  <style>
+    .surface  { fill: #1A1E2A; }
+    .panel    { fill: #20242F; stroke: #353A47; stroke-width: 1; }
+    .panel-warm { fill: #2A2519; stroke: #4D3E2A; stroke-width: 1; }
+    .panel-band { fill: #1F2330; stroke: #353A47; stroke-width: 1; }
+    .ink      { fill: #F2EFEA; }
+    .muted    { fill: #9D9388; }
+    .accent   { fill: #DD8E5C; }
+    .accent-bg{ fill: #DD8E5C; }
+    .rule     { stroke: #353A47; }
+    .arrow-ink   { stroke: #F2EFEA; fill: none; }
+    .arrow-muted { stroke: #9D9388; fill: none; }
+    .arrow-accent{ stroke: #DD8E5C; fill: none; }
+    .h1 { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 700; font-size: 18px; letter-spacing: -0.005em; }
+    .h2 { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 600; font-size: 14px; letter-spacing: 0.02em; }
+    .body { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 400; font-size: 12px; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-weight: 400; font-size: 11px; }
+    .eyebrow { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 600; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; }
+    .badge { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 700; font-size: 11px; }
+    .badge-text { fill: #1A1E2A; }
+  </style>
+
+  <rect class="surface" width="1200" height="1080"/>
+
+  <text class="eyebrow muted" x="60" y="40">ARCHITECTURE</text>
+  <text class="h1 ink" x="60" y="68">Processing pipeline. Numbers ① to ⑧ mark fork fixes; see legend.</text>
+
+  <g transform="translate(440, 100)">
+    <rect class="panel" width="320" height="64" rx="6"/>
+    <text class="eyebrow muted" x="16" y="22">CLIENT</text>
+    <text class="h2 ink" x="16" y="44">Claude Code · Anthropic SDK</text>
+    <text class="mono muted" x="16" y="58">ANTHROPIC_BASE_URL → kirocc-pro</text>
+  </g>
+
+  <path d="M 540 164 L 540 196" class="arrow-ink" stroke-width="1.4" marker-end="url(#arrow-ink-d)"/>
+  <path d="M 660 196 L 660 164" class="arrow-muted" stroke-width="1.4" marker-end="url(#arrow-muted-d)" stroke-dasharray="4 4"/>
+  <text class="mono muted" x="476" y="184">POST JSON</text>
+  <text class="mono muted" x="676" y="184">SSE response</text>
+
+  <g transform="translate(60, 200)">
+    <rect class="panel-band" width="1080" height="60" rx="6"/>
+    <text class="eyebrow muted" x="16" y="22">MIDDLEWARE</text>
+    <g class="mono ink" font-size="12">
+      <text x="160" y="40">[ OTel tracing ]</text>
+      <text x="340" y="40">[ Trace ID ]</text>
+      <text x="500" y="40">[ CORS ]</text>
+      <text x="660" y="40">[ API Key Auth ]</text>
+      <text x="860" y="40">[ Request/Response Logging ]</text>
+    </g>
+  </g>
+
+  <path d="M 540 260 L 540 292" class="arrow-ink" stroke-width="1.4" marker-end="url(#arrow-ink-d)"/>
+
+  <g transform="translate(380, 296)">
+    <rect class="panel" width="340" height="72" rx="6"/>
+    <text class="eyebrow muted" x="16" y="22">HANDLER</text>
+    <text class="h2 ink" x="16" y="44">Messages Handler</text>
+    <text class="mono muted" x="16" y="60">resolveModel · resolveThinking · sessionID fallback (fork)</text>
+  </g>
+
+  <g transform="translate(760, 296)">
+    <rect class="panel" width="320" height="72" rx="6"/>
+    <text class="eyebrow muted" x="16" y="22">AUTH</text>
+    <text class="h2 ink" x="16" y="44">SQLite + Token Refresh</text>
+    <text class="mono muted" x="16" y="60">read creds · refresh on 403 · atomic write-back</text>
+  </g>
+
+  <path d="M 720 332 L 760 332" class="arrow-muted" stroke-width="1.2" stroke-dasharray="3 3"/>
+  <path d="M 760 332 L 720 332" class="arrow-muted" stroke-width="1.2" stroke-dasharray="3 3"/>
+
+  <path d="M 360 368 L 360 412" class="arrow-accent" stroke-width="1.6" marker-end="url(#arrow-accent-d)"/>
+  <text class="eyebrow accent" x="120" y="408">REQUEST CONVERSION</text>
+  <text class="mono muted" x="320" y="408">Anthropic JSON → Kiro payload</text>
+
+  <path d="M 840 412 L 840 368" class="arrow-ink" stroke-width="1.6" marker-end="url(#arrow-ink-d)"/>
+  <text class="eyebrow muted" x="620" y="408">RESPONSE CONVERSION</text>
+  <text class="mono muted" x="820" y="408">Anthropic SSE / JSON ←</text>
+
+  <g transform="translate(60, 430)">
+    <rect class="panel" width="480" height="52" rx="5"/>
+    <text class="h2 ink" x="14" y="22">1. Model Resolution</text>
+    <text class="mono muted" x="14" y="42">claude-sonnet-4-6 → claude-sonnet-4.6 · custom map</text>
+
+    <g transform="translate(0, 64)">
+      <rect class="panel-warm" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">2. Message Normalization</text>
+      <text class="mono muted" x="14" y="42">merge same-role · extract multi-block · MCP cleanup</text>
+      <g transform="translate(420, 14)">
+        <circle class="accent-bg" cx="12" cy="12" r="11"/>
+        <text class="badge badge-text" x="12" y="16" text-anchor="middle">①</text>
+        <circle class="accent-bg" cx="38" cy="12" r="11"/>
+        <text class="badge badge-text" x="38" y="16" text-anchor="middle">②</text>
+      </g>
+    </g>
+
+    <g transform="translate(0, 128)">
+      <rect class="panel" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">3. Tool &amp; Schema Conversion</text>
+      <text class="mono muted" x="14" y="42">flatten anyOf/oneOf/allOf · strip unsupported keys</text>
+    </g>
+
+    <g transform="translate(0, 192)">
+      <rect class="panel" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">4. Tool Search Partition</text>
+      <text class="mono muted" x="14" y="42">defer_loading tools → active / deferred · inject ToolSearch</text>
+    </g>
+
+    <g transform="translate(0, 256)">
+      <rect class="panel-warm" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">5. Thinking Injection</text>
+      <text class="mono muted" x="14" y="42">&lt;thinking_mode&gt; · &lt;max_thinking_length&gt; · budget floor</text>
+      <g transform="translate(446, 14)">
+        <circle class="accent-bg" cx="12" cy="12" r="11"/>
+        <text class="badge badge-text" x="12" y="16" text-anchor="middle">⑧</text>
+      </g>
+    </g>
+
+    <g transform="translate(0, 320)">
+      <rect class="panel" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">6. Cache Point Conversion</text>
+      <text class="mono muted" x="14" y="42">tool-level cache_control → Kiro cachePoint</text>
+    </g>
+  </g>
+
+  <path d="M 300 802 L 300 838" class="arrow-accent" stroke-width="1.6" marker-end="url(#arrow-accent-d)"/>
+
+  <g transform="translate(660, 430)">
+    <rect class="panel" width="480" height="52" rx="5"/>
+    <text class="h2 ink" x="14" y="22">7. AWS Event Stream Parser</text>
+    <text class="mono muted" x="14" y="42">binary frames → typed events · cumulative text</text>
+
+    <g transform="translate(0, 64)">
+      <rect class="panel-warm" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">8. Accumulator + Tool Input Validator</text>
+      <text class="mono muted" x="14" y="42">cumulative → delta · required-field &amp; type checks</text>
+      <g transform="translate(420, 14)">
+        <circle class="accent-bg" cx="12" cy="12" r="11"/>
+        <text class="badge badge-text" x="12" y="16" text-anchor="middle">③</text>
+        <circle class="accent-bg" cx="38" cy="12" r="11"/>
+        <text class="badge badge-text" x="38" y="16" text-anchor="middle">④</text>
+      </g>
+    </g>
+
+    <g transform="translate(0, 128)">
+      <rect class="panel" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">9. Thinking Tag Parser</text>
+      <text class="mono muted" x="14" y="42">&lt;thinking&gt; tags · reasoningContentEvent · dedup</text>
+    </g>
+
+    <g transform="translate(0, 192)">
+      <rect class="panel-warm" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">10. Tool Search Inner Loop</text>
+      <text class="mono muted" x="14" y="42">execute regex/BM25 · 3 rounds · graceful error</text>
+      <g transform="translate(446, 14)">
+        <circle class="accent-bg" cx="12" cy="12" r="11"/>
+        <text class="badge badge-text" x="12" y="16" text-anchor="middle">⑦</text>
+      </g>
+    </g>
+
+    <g transform="translate(0, 256)">
+      <rect class="panel-warm" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">11. Invalid Tool Retry &amp; Fallback</text>
+      <text class="mono muted" x="14" y="42">reflow as tool_result(is_error) · bounded retry · visible-error fallback</text>
+      <g transform="translate(420, 14)">
+        <circle class="accent-bg" cx="12" cy="12" r="11"/>
+        <text class="badge badge-text" x="12" y="16" text-anchor="middle">⑤</text>
+        <circle class="accent-bg" cx="38" cy="12" r="11"/>
+        <text class="badge badge-text" x="38" y="16" text-anchor="middle">⑥</text>
+      </g>
+    </g>
+
+    <g transform="translate(0, 320)">
+      <rect class="panel" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">12. stop_sequences / max_tokens / Truncation</text>
+      <text class="mono muted" x="14" y="42">adapter-side enforcement · truncation notice injection</text>
+    </g>
+
+    <g transform="translate(0, 384)">
+      <rect class="panel" width="480" height="52" rx="5"/>
+      <text class="h2 ink" x="14" y="22">13. Gate Writer (buffered)</text>
+      <text class="mono muted" x="14" y="42">withhold output until visible content · transparent retry</text>
+    </g>
+  </g>
+
+  <path d="M 900 838 L 900 870" class="arrow-muted" stroke-width="1.6" marker-end="url(#arrow-muted-d)" stroke-dasharray="3 3"/>
+
+  <g transform="translate(440, 838)">
+    <rect class="panel-warm" width="320" height="72" rx="6"/>
+    <text class="eyebrow muted" x="16" y="22">UPSTREAM</text>
+    <text class="h2 ink" x="16" y="44">Kiro API</text>
+    <text class="mono muted" x="16" y="60">q.{region}.amazonaws.com · 403/429/5xx retry</text>
+  </g>
+
+  <path d="M 300 802 L 300 870 L 436 870" class="arrow-accent" stroke-width="1.6" fill="none" marker-end="url(#arrow-accent-d)"/>
+  <path d="M 764 870 L 900 870 L 900 484" class="arrow-ink" stroke-width="1.6" fill="none" marker-end="url(#arrow-ink-d)"/>
+
+  <g transform="translate(60, 950)">
+    <line class="rule" x1="0" y1="-6" x2="1080" y2="-6" stroke-width="1"/>
+    <text class="eyebrow muted" x="0" y="14">FORK FIX INDEX</text>
+    <g class="mono ink" font-size="11">
+      <text x="0"   y="42">① MCP cleanup</text>
+      <text x="160" y="42">② Preserve non-MCP reminders</text>
+      <text x="380" y="42">③ tool_use required check</text>
+      <text x="580" y="42">④ tool_use type check</text>
+      <text x="760" y="42">⑤ Invalid tool retry</text>
+      <text x="940" y="42">⑥ Visible error fallback</text>
+      <text x="0"   y="66">⑦ ToolSearch graceful error</text>
+      <text x="240" y="66">⑧ FORCE_THINKING_BUDGET floor</text>
+    </g>
+  </g>
+</svg>

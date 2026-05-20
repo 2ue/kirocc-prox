@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" role="img" aria-label="Observability icon">
+  <title>Observability / Telemetry</title>
+  <g fill="none" stroke="#C77B45" stroke-width="1.6" stroke-linecap="round">
+    <circle cx="12" cy="12" r="1.8" fill="#C77B45"/>
+    <circle cx="12" cy="12" r="5.5"/>
+    <circle cx="12" cy="12" r="9.5" opacity="0.55"/>
+  </g>
+</svg>

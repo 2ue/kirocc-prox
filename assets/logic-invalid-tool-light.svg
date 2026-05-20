@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 780" role="img" aria-label="Decision tree: how kirocc-pro handles invalid tool_use blocks emitted by the model.">
+  <title>Invalid tool_use decision tree</title>
+  <desc>Two-stage recovery for malformed tool_use blocks: validator withholds the block, the proxy reflows it as tool_result(is_error=true) and re-calls Kiro once; if the second attempt is still invalid, a visible-error fallback is written to the client.</desc>
+
+  <defs>
+    <marker id="arrow-ink-il" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2A2622"/>
+    </marker>
+    <marker id="arrow-accent-il" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#C77B45"/>
+    </marker>
+  </defs>
+
+  <style>
+    .surface { fill: #FAF8F5; }
+    .node     { fill: #FFFFFF; stroke: #2A2622; stroke-width: 1.4; }
+    .node-warm{ fill: #FBF6F0; stroke: #C77B45; stroke-width: 1.4; }
+    .node-good{ fill: #FFFFFF; stroke: #2A2622; stroke-width: 2; }
+    .node-bad { fill: #F4E5DA; stroke: #C77B45; stroke-width: 2; }
+    .ink      { fill: #2A2622; }
+    .muted    { fill: #7A7167; }
+    .accent   { fill: #C77B45; }
+    .accent-bg{ fill: #C77B45; }
+    .rule     { stroke: #D8D2CA; }
+    .arrow-ink   { stroke: #2A2622; fill: none; }
+    .arrow-accent{ stroke: #C77B45; fill: none; }
+
+    .h1 { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 700; font-size: 18px; letter-spacing: -0.005em; }
+    .h2 { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 600; font-size: 14px; letter-spacing: 0.01em; }
+    .body { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 400; font-size: 12px; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-weight: 400; font-size: 11px; }
+    .eyebrow { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 600; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; }
+    .branch  { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 700; font-size: 11px; letter-spacing: 0.12em; }
+    .badge { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 700; font-size: 11px; fill: #FAF8F5; }
+  </style>
+
+  <rect class="surface" width="1200" height="780"/>
+
+  <!-- Title -->
+  <text class="eyebrow muted" x="60" y="40">FORK LOGIC · INVALID TOOL_USE</text>
+  <text class="h1 ink" x="60" y="68">Two-stage recovery. Withhold, reflow, retry once, fall back visibly.</text>
+
+  <!-- 1. Start: model emits tool_use -->
+  <g transform="translate(480, 100)">
+    <rect class="node" width="240" height="56" rx="6"/>
+    <text class="eyebrow muted" x="16" y="22">STEP 1 · UPSTREAM</text>
+    <text class="h2 ink" x="16" y="44">Model emits tool_use</text>
+  </g>
+
+  <!-- arrow down -->
+  <path d="M 600 156 L 600 188" class="arrow-ink" stroke-width="1.6" marker-end="url(#arrow-ink-il)"/>
+
+  <!-- 2. Validator (decision) -->
+  <g transform="translate(420, 192)">
+    <rect class="node-warm" width="360" height="76" rx="6"/>
+    <text class="eyebrow accent" x="16" y="24">STEP 2 · DECISION · FIX ③④</text>
+    <text class="h2 ink" x="16" y="46">Tool Input Validator</text>
+    <text class="mono muted" x="16" y="64">required fields present? top-level types correct?</text>
+    <g transform="translate(312, 14)">
+      <circle class="accent-bg" cx="12" cy="12" r="12"/>
+      <text class="badge" x="12" y="16" text-anchor="middle">③</text>
+      <circle class="accent-bg" cx="38" cy="12" r="12"/>
+      <text class="badge" x="38" y="16" text-anchor="middle">④</text>
+    </g>
+  </g>
+
+  <!-- Branch labels and lines -->
+  <!-- YES branch (left, valid -> forward) -->
+  <path d="M 510 268 L 510 320 L 270 320 L 270 348" class="arrow-ink" stroke-width="1.5" fill="none" marker-end="url(#arrow-ink-il)"/>
+  <text class="branch ink" x="350" y="312">VALID  →</text>
+
+  <!-- NO branch (right, invalid -> withhold + reflow) -->
+  <path d="M 690 268 L 690 320 L 940 320 L 940 348" class="arrow-accent" stroke-width="1.5" fill="none" marker-end="url(#arrow-accent-il)"/>
+  <text class="branch accent" x="780" y="312">←  INVALID</text>
+
+  <!-- 3a. Terminal LEFT: forward (happy path) -->
+  <g transform="translate(120, 352)">
+    <rect class="node-good" width="300" height="76" rx="6"/>
+    <text class="eyebrow muted" x="16" y="24">STEP 3 · HAPPY PATH</text>
+    <text class="h2 ink" x="16" y="46">Forward to client</text>
+    <text class="mono muted" x="16" y="64">SSE / JSON · no fork intervention</text>
+  </g>
+
+  <!-- 3b. Action RIGHT: withhold + reflow -->
+  <g transform="translate(780, 352)">
+    <rect class="node-warm" width="320" height="108" rx="6"/>
+    <text class="eyebrow accent" x="16" y="24">STEP 3 · WITHHOLD · FIX ⑤</text>
+    <text class="h2 ink" x="16" y="46">Reflow as tool_result(is_error=true)</text>
+    <text class="mono muted" x="16" y="66">drop the invalid block from the client stream;</text>
+    <text class="mono muted" x="16" y="82">append synthetic tool_result with the parse error;</text>
+    <text class="mono muted" x="16" y="98">re-call Kiro with the corrected message list.</text>
+    <g transform="translate(286, 14)">
+      <circle class="accent-bg" cx="12" cy="12" r="12"/>
+      <text class="badge" x="12" y="16" text-anchor="middle">⑤</text>
+    </g>
+  </g>
+
+  <!-- arrow from reflow down to second decision -->
+  <path d="M 940 460 L 940 488" class="arrow-accent" stroke-width="1.6" marker-end="url(#arrow-accent-il)"/>
+
+  <!-- 4. Second decision: still invalid? -->
+  <g transform="translate(760, 492)">
+    <rect class="node-warm" width="360" height="76" rx="6"/>
+    <text class="eyebrow accent" x="16" y="24">STEP 4 · DECISION · FIX ⑥</text>
+    <text class="h2 ink" x="16" y="46">Re-call result: still invalid?</text>
+    <text class="mono muted" x="16" y="64">bounded retry · no third attempt allowed</text>
+    <g transform="translate(312, 14)">
+      <circle class="accent-bg" cx="12" cy="12" r="12"/>
+      <text class="badge" x="12" y="16" text-anchor="middle">⑥</text>
+    </g>
+  </g>
+
+  <!-- Branches from second decision -->
+  <!-- NO (valid this time) -> Forward (self-heal) -->
+  <path d="M 830 568 L 830 600 L 620 600 L 620 628" class="arrow-ink" stroke-width="1.5" fill="none" marker-end="url(#arrow-ink-il)"/>
+  <text class="branch ink" x="680" y="592">VALID  →</text>
+
+  <!-- YES (still invalid) -> Visible error fallback -->
+  <path d="M 1040 568 L 1040 600 L 1040 628" class="arrow-accent" stroke-width="1.5" fill="none" marker-end="url(#arrow-accent-il)"/>
+  <text class="branch accent" x="980" y="592">STILL INVALID  ↓</text>
+
+  <!-- 5a. Forward (self-heal) -->
+  <g transform="translate(470, 632)">
+    <rect class="node-good" width="300" height="76" rx="6"/>
+    <text class="eyebrow muted" x="16" y="24">STEP 5 · SELF-HEAL</text>
+    <text class="h2 ink" x="16" y="46">Forward to client</text>
+    <text class="mono muted" x="16" y="64">model corrected itself · no client-visible failure</text>
+  </g>
+
+  <!-- 5b. Visible error fallback -->
+  <g transform="translate(880, 632)">
+    <rect class="node-bad" width="280" height="76" rx="6"/>
+    <text class="eyebrow accent" x="16" y="24">STEP 5 · DEGRADED</text>
+    <text class="h2 ink" x="16" y="46">Visible error fallback</text>
+    <text class="mono muted" x="16" y="64">client sees a clear error · no 502 deadlock</text>
+  </g>
+
+  <!-- Legend -->
+  <g transform="translate(60, 738)">
+    <line class="rule" x1="0" y1="-12" x2="1080" y2="-12" stroke-width="1"/>
+    <g class="mono muted">
+      <rect class="node" x="0" y="-6" width="14" height="14" rx="2"/>
+      <text x="22" y="6">action / forward</text>
+      <rect class="node-warm" x="160" y="-6" width="14" height="14" rx="2"/>
+      <text x="182" y="6">fork-modified path</text>
+      <rect class="node-bad" x="340" y="-6" width="14" height="14" rx="2"/>
+      <text x="362" y="6">degraded outcome</text>
+      <text x="540" y="6">Counterpart of fix ⑤⑥ in invalid_tool_retry.go / invalid_tool_fallback.go.</text>
+    </g>
+  </g>
+</svg>

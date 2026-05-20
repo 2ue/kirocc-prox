@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 260" role="img" aria-label="kirocc-pro: a local Anthropic Messages API to Kiro proxy.">
+  <title>kirocc-pro</title>
+  <desc>A local Anthropic Messages API to Kiro proxy, battle-hardened fork of d-kuro/kirocc.</desc>
+
+  <style>
+    .surface { fill: #1A1E2A; }
+    .ink     { fill: #F2EFEA; }
+    .muted   { fill: #9D9388; }
+    .accent  { fill: #DD8E5C; }
+    .rule    { stroke: #2A2F3A; }
+
+    .wordmark { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-weight: 700; letter-spacing: -0.02em; }
+    .suffix   { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; font-weight: 300; letter-spacing: -0.01em; }
+    .tagline  { font-family: ui-sans-serif, system-ui, -apple-system, "Inter", sans-serif; font-weight: 400; }
+    .label    { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 500; font-size: 13px; letter-spacing: 0.12em; }
+  </style>
+
+  <rect class="surface" width="1200" height="260"/>
+
+  <text class="label muted" x="60" y="56">A LOCAL PROXY · ANTHROPIC ⇄ KIRO</text>
+
+  <text class="wordmark ink"     x="60"  y="148" font-size="92">kirocc</text>
+  <text class="suffix accent"    x="328" y="148" font-size="92">-pro</text>
+
+  <line class="rule" x1="60" y1="178" x2="1140" y2="178" stroke-width="1"/>
+
+  <text class="tagline ink"   x="60" y="214" font-size="22">Drop-in Messages API proxy. Battle-hardened fork of d-kuro/kirocc.</text>
+  <text class="tagline muted" x="60" y="240" font-size="15">Claude Code, Kiro credentials, real model intelligence in long sessions.</text>
+</svg>

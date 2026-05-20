@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · kirocc-pro 管理后台</title>
+  <link rel="stylesheet" href="/admin/assets/style.css">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%230b110d'/%3E%3Crect x='1' y='1' width='30' height='30' rx='4' fill='none' stroke='%2349e08c' stroke-width='1.2'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='ui-monospace,Menlo,monospace' font-size='17' font-weight='700' fill='%2349e08c'%3EK%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <div class="login-shell">
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span>kirocc-pro</span>
+      </div>
+      <h1 class="login-title">管理后台登录</h1>
+      <p class="login-sub">输入管理密钥访问账号池、配额与用量面板。</p>
+
+      <div id="errBox" class="login-error" hidden>密钥错误，请重试。</div>
+
+      <form class="login-form" method="post" action="/admin/login" autocomplete="off">
+        <label for="key">管理密钥</label>
+        <input id="key" name="key" type="password" required autofocus
+               placeholder="-admin-key / KIROCC_ADMIN_KEY">
+        <button type="submit" class="submit">登录</button>
+      </form>
+
+      <div class="login-hint">
+        命令行调用可省略登录，使用：<br>
+        <code>curl -H "Authorization: Bearer &lt;key&gt;" http://127.0.0.1:3457/admin/health</code>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Show error banner when redirected back with ?error=1
+    if (new URLSearchParams(location.search).get('error') === '1') {
+      document.getElementById('errBox').hidden = false;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>kirocc Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --border: #2e3347;
+    --text: #e2e8f0;
+    --text-muted: #8892a4;
+    --accent: #6366f1;
+    --accent-dim: #4f52c9;
+    --green: #22c55e;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --blue: #3b82f6;
+    --radius: 8px;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; line-height: 1.5; }
+  a { color: var(--accent); text-decoration: none; }
+
+  /* Layout */
+  .header { display: flex; align-items: center; justify-content: space-between; padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .logo { font-size: 18px; font-weight: 700; color: var(--text); letter-spacing: -0.3px; }
+  .logo span { color: var(--accent); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); transition: background 0.3s; }
+  .status-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.error { background: var(--red); }
+  .status-label { font-size: 12px; color: var(--text-muted); }
+  .main { max-width: 1400px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 24px; }
+
+  /* Cards */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .card-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-muted); margin-bottom: 16px; }
+
+  /* Stats grid */
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+  .stat-card { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 20px; }
+  .stat-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-muted); margin-bottom: 8px; }
+  .stat-value { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); line-height: 1; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.yellow { color: var(--yellow); }
+  .stat-value.blue { color: var(--blue); }
+  .stat-sub { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+  /* Log table */
+  .log-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .log-controls { display: flex; gap: 8px; align-items: center; }
+  .btn { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface2); color: var(--text); font-size: 12px; cursor: pointer; transition: background 0.15s; }
+  .btn:hover { background: var(--border); }
+  .btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge.ok { background: rgba(34,197,94,0.15); color: var(--green); }
+  .badge.error { background: rgba(239,68,68,0.15); color: var(--red); }
+  .badge.retry { background: rgba(245,158,11,0.15); color: var(--yellow); }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 1px solid var(--border); white-space: nowrap; }
+  tbody tr { border-bottom: 1px solid rgba(46,51,71,0.5); transition: background 0.1s; }
+  tbody tr:hover { background: var(--surface2); }
+  tbody tr.new-row { animation: fadeIn 0.4s ease; }
+  td { padding: 9px 12px; color: var(--text); white-space: nowrap; }
+  td.mono { font-family: var(--mono); font-size: 12px; }
+  td.muted { color: var(--text-muted); }
+  .empty-state { text-align: center; padding: 48px; color: var(--text-muted); }
+
+  @keyframes fadeIn { from { background: rgba(99,102,241,0.12); } to { background: transparent; } }
+
+  /* Config panel */
+  .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  @media (max-width: 768px) { .config-grid { grid-template-columns: 1fr; } }
+  .config-section-title { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 12px; }
+  .config-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(46,51,71,0.5); }
+  .config-row:last-child { border-bottom: none; }
+  .config-key { font-size: 13px; color: var(--text-muted); }
+  .config-val { font-family: var(--mono); font-size: 12px; color: var(--text); }
+  .config-val.redacted { color: var(--text-muted); font-style: italic; }
+
+  /* Editable config */
+  .edit-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid rgba(46,51,71,0.5); }
+  .edit-row:last-child { border-bottom: none; }
+  .edit-label { flex: 1; font-size: 13px; color: var(--text); }
+  .edit-desc { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+  .toggle { position: relative; width: 40px; height: 22px; flex-shrink: 0; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider { position: absolute; inset: 0; background: var(--border); border-radius: 11px; cursor: pointer; transition: background 0.2s; }
+  .toggle-slider::before { content: ''; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: transform 0.2s; }
+  .toggle input:checked + .toggle-slider { background: var(--accent); }
+  .toggle input:checked + .toggle-slider::before { transform: translateX(18px); }
+  .number-input { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-family: var(--mono); font-size: 12px; padding: 4px 8px; width: 100px; }
+  .number-input:focus { outline: none; border-color: var(--accent); }
+  .save-btn { padding: 6px 16px; border-radius: 6px; border: none; background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+  .save-btn:hover { background: var(--accent-dim); }
+  .save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .save-status { font-size: 12px; color: var(--green); opacity: 0; transition: opacity 0.3s; }
+  .save-status.visible { opacity: 1; }
+  .save-status.error { color: var(--red); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">kiro<span>cc</span></div>
+    <div class="status-dot" id="statusDot"></div>
+    <div class="status-label" id="statusLabel">连接中…</div>
+  </div>
+  <div style="font-size:12px;color:var(--text-muted)" id="lastUpdate"></div>
+</div>
+
+<div class="main">
+
+  <!-- Stats -->
+  <div>
+    <div class="card-title">概览</div>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">总请求数</div>
+        <div class="stat-value" id="statTotal">—</div>
+        <div class="stat-sub" id="statTokens">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">成功率</div>
+        <div class="stat-value green" id="statSuccess">—</div>
+        <div class="stat-sub" id="statSuccessAbs">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">重试率</div>
+        <div class="stat-value yellow" id="statRetry">—</div>
+        <div class="stat-sub" id="statRetryAbs">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">平均延迟</div>
+        <div class="stat-value blue" id="statLatency">—</div>
+        <div class="stat-sub">毫秒</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">输入 Token</div>
+        <div class="stat-value" id="statInputTok">—</div>
+        <div class="stat-sub">累计</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">输出 Token</div>
+        <div class="stat-value" id="statOutputTok">—</div>
+        <div class="stat-sub">累计</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Request Log -->
+  <div class="card">
+    <div class="log-header">
+      <div class="card-title" style="margin-bottom:0">请求日志</div>
+      <div class="log-controls">
+        <span id="logCount" style="font-size:12px;color:var(--text-muted)"></span>
+        <button class="btn" onclick="clearLog()">清空</button>
+        <button class="btn" id="pauseBtn" onclick="togglePause()">暂停</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>模型</th>
+            <th>状态</th>
+            <th>输入</th>
+            <th>输出</th>
+            <th>上下文%</th>
+            <th>延迟</th>
+            <th>重试</th>
+            <th>流式</th>
+            <th>思考</th>
+            <th>会话</th>
+          </tr>
+        </thead>
+        <tbody id="logBody">
+          <tr><td colspan="11" class="empty-state">等待请求…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Config -->
+  <div class="card">
+    <div class="card-title">配置</div>
+    <div class="config-grid">
+      <!-- Read-only info -->
+      <div>
+        <div class="config-section-title">服务器信息</div>
+        <div id="configReadonly"></div>
+      </div>
+      <!-- Editable -->
+      <div>
+        <div class="config-section-title">运行时设置</div>
+        <div id="configEditable"></div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:16px">
+          <button class="save-btn" id="saveBtn" onclick="saveConfig()">保存修改</button>
+          <span class="save-status" id="saveStatus"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let paused = false;
+let logRows = [];
+const MAX_ROWS = 200;
+let pendingRows = [];
+let configState = {};
+
+// ── Stats ──────────────────────────────────────────────────────────────────
+async function fetchStats() {
+  try {
+    const r = await fetch('/dashboard/api/stats');
+    if (!r.ok) return;
+    const s = await r.json();
+    renderStats(s);
+  } catch {}
+}
+
+function renderStats(s) {
+  setText('statTotal', fmt(s.total_requests));
+  setText('statTokens', `${fmtK(s.total_input_tokens)} in / ${fmtK(s.total_output_tokens)} out`);
+  setText('statSuccess', s.total_requests ? s.success_rate.toFixed(1) + '%' : '—');
+  setText('statSuccessAbs', `${fmt(s.success_count)} / ${fmt(s.total_requests)}`);
+  setText('statRetry', s.total_requests ? s.retry_rate.toFixed(1) + '%' : '—');
+  setText('statRetryAbs', `${fmt(s.retry_count)} retried`);
+  setText('statLatency', s.total_requests ? Math.round(s.avg_latency_ms) : '—');
+  setText('statInputTok', fmtK(s.total_input_tokens));
+  setText('statOutputTok', fmtK(s.total_output_tokens));
+  setText('lastUpdate', '更新于 ' + new Date().toLocaleTimeString('zh-CN'));
+}
+
+// ── Log ────────────────────────────────────────────────────────────────────
+async function fetchLogs() {
+  try {
+    const r = await fetch('/dashboard/api/logs?n=100');
+    if (!r.ok) return;
+    const rows = await r.json();
+    if (!rows || !rows.length) return;
+    logRows = rows;
+    renderLogTable();
+  } catch {}
+}
+
+function renderLogTable() {
+  const tbody = document.getElementById('logBody');
+  if (!logRows.length) {
+    tbody.innerHTML = '<tr><td colspan="11" class="empty-state">等待请求…</td></tr>';
+    setText('logCount', '');
+    return;
+  }
+  // Newest first
+  const sorted = [...logRows].reverse();
+  tbody.innerHTML = sorted.map(r => rowHTML(r, false)).join('');
+  setText('logCount', `${logRows.length} 条请求`);
+}
+
+function prependRow(rec) {
+  if (paused) { pendingRows.push(rec); return; }
+  logRows.push(rec);
+  if (logRows.length > MAX_ROWS) logRows.shift();
+
+  const tbody = document.getElementById('logBody');
+  // Remove empty state row if present
+  if (tbody.querySelector('.empty-state')) tbody.innerHTML = '';
+
+  const tr = document.createElement('tr');
+  tr.className = 'new-row';
+  tr.innerHTML = rowHTML(rec, false);
+  tbody.insertBefore(tr, tbody.firstChild);
+
+  // Trim excess rows from bottom
+  while (tbody.rows.length > MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+  setText('logCount', `${logRows.length} 条请求`);
+  fetchStats();
+}
+
+function rowHTML(r) {
+  const t = new Date(r.time);
+  const timeStr = t.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const ms = r.latency_ms >= 1000 ? (r.latency_ms/1000).toFixed(1)+'s' : r.latency_ms+'ms';
+  const ctx = r.context_pct > 0 ? r.context_pct.toFixed(1)+'%' : '—';
+  const ctxClass = r.context_pct >= 90 ? 'color:var(--red)' : r.context_pct >= 70 ? 'color:var(--yellow)' : '';
+  const model = r.model.length > 24 ? r.model.slice(0,22)+'…' : r.model;
+  const session = r.session_id ? r.session_id.slice(0,8) : '—';
+  return `<td class="mono muted">${timeStr}</td>
+    <td title="${esc(r.model)}">${esc(model)}</td>
+    <td><span class="badge ${r.status}">${r.status}</span></td>
+    <td class="mono">${fmt(r.input_tokens)}</td>
+    <td class="mono">${fmt(r.output_tokens)}</td>
+    <td class="mono" style="${ctxClass}">${ctx}</td>
+    <td class="mono">${ms}</td>
+    <td class="mono">${r.retry_count || '—'}</td>
+    <td>${r.stream ? '✓' : ''}</td>
+    <td>${r.thinking ? '✓' : ''}</td>
+    <td class="mono muted" title="${esc(r.session_id)}">${esc(session)}</td>`;
+}
+
+function clearLog() { logRows = []; renderLogTable(); }
+
+function togglePause() {
+  paused = !paused;
+  const btn = document.getElementById('pauseBtn');
+  btn.textContent = paused ? '继续' : '暂停';
+  btn.classList.toggle('active', paused);
+  if (!paused && pendingRows.length) {
+    pendingRows.forEach(r => prependRow(r));
+    pendingRows = [];
+  }
+}
+
+// ── Config ─────────────────────────────────────────────────────────────────
+async function fetchConfig() {
+  try {
+    const r = await fetch('/dashboard/api/config');
+    if (!r.ok) return;
+    configState = await r.json();
+    renderConfig(configState);
+  } catch {}
+}
+
+function renderConfig(c) {
+  const ro = document.getElementById('configReadonly');
+  ro.innerHTML = [
+    ['主机', c.host],
+    ['端口', c.port],
+    ['数据库路径', c.db_path || '—'],
+    ['API Key', c.api_key_set ? '••••••••' : '未设置'],
+    ['OTel', c.otel ? '已启用' : '已禁用'],
+    ['日志文件', c.log_file_path || '—'],
+  ].map(([k,v]) => `<div class="config-row">
+    <span class="config-key">${k}</span>
+    <span class="config-val">${esc(String(v))}</span>
+  </div>`).join('');
+
+  const ed = document.getElementById('configEditable');
+  ed.innerHTML = `
+    <div class="edit-row">
+      <div class="edit-label">
+        调试日志
+        <div class="edit-desc">开启详细调试输出</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="cfgDebug" ${c.debug ? 'checked' : ''}>
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+    <div class="edit-row">
+      <div class="edit-label">
+        OTel Body 限制
+        <div class="edit-desc">Span 中捕获的最大字节数（0 = 不限制）</div>
+      </div>
+      <input type="number" class="number-input" id="cfgOtelLimit" value="${c.otel_body_limit}" min="0">
+    </div>`;
+}
+
+async function saveConfig() {
+  const btn = document.getElementById('saveBtn');
+  const status = document.getElementById('saveStatus');
+  btn.disabled = true;
+  status.className = 'save-status';
+  status.textContent = '';
+
+  const patch = {
+    debug: document.getElementById('cfgDebug').checked,
+    otel_body_limit: parseInt(document.getElementById('cfgOtelLimit').value, 10) || 0,
+  };
+
+  try {
+    const r = await fetch('/dashboard/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (r.ok) {
+      status.textContent = '已保存';
+      status.className = 'save-status visible';
+      await fetchConfig();
+    } else {
+      const e = await r.json();
+      status.textContent = e.error || '保存失败';
+      status.className = 'save-status visible error';
+    }
+  } catch (e) {
+    status.textContent = '网络错误';
+    status.className = 'save-status visible error';
+  }
+  btn.disabled = false;
+  setTimeout(() => { status.className = 'save-status'; }, 3000);
+}
+
+// ── SSE ────────────────────────────────────────────────────────────────────
+function connectSSE() {
+  const dot = document.getElementById('statusDot');
+  const label = document.getElementById('statusLabel');
+  const es = new EventSource('/dashboard/api/stream');
+
+  es.addEventListener('ping', () => {
+    dot.className = 'status-dot connected';
+    label.textContent = '实时';
+  });
+
+  es.addEventListener('request', e => {
+    try { prependRow(JSON.parse(e.data)); } catch {}
+  });
+
+  es.onerror = () => {
+    dot.className = 'status-dot error';
+    label.textContent = '重连中…';
+  };
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+function fmt(n) { return n == null ? '—' : Number(n).toLocaleString(); }
+function fmtK(n) { if (!n) return '0'; return n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n); }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// ── Init ───────────────────────────────────────────────────────────────────
+fetchStats();
+fetchLogs();
+fetchConfig();
+connectSSE();
+setInterval(fetchStats, 10000);
+</script>
+</body>
+</html>

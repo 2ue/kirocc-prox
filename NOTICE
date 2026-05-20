@@ -1,0 +1,28 @@
+kirocc-pro
+Copyright 2026 niuma and kirocc-pro contributors
+
+This product includes software developed at d-kuro/kirocc
+(https://github.com/d-kuro/kirocc), Copyright (c) d-kuro and the
+upstream kirocc contributors, licensed under the Apache License,
+Version 2.0 (see LICENSE).
+
+Substantial modifications and additions made by the kirocc-pro
+project. See the commit history and files marked with `// [fork]`
+for the full set of changes; the most prominent additions are:
+
+  * 8 protocol-hardening fixes on top of the upstream Anthropic ↔ Kiro
+    translator (see README_3460_OPTIMIZED.md).
+  * A web admin UI (internal/admin/) with multi-account pool
+    management, per-account proxies, region-aware routing, multi
+    API key auth with expiry and token quotas, usage attribution
+    by key and device, and remote API automation.
+  * Per-credential outbound HTTP client cache for proxy isolation
+    (internal/proxyhttp/).
+  * GeoIP-driven region preference using MaxMind GeoLite2-Country
+    (internal/georegion/).
+  * Runtime-mutable settings store with optimization knob
+    persistence (internal/settings/).
+
+The upstream kirocc project is unaffiliated with this fork; please
+direct fork-specific issues to the kirocc-pro repository, and
+upstream protocol issues to d-kuro/kirocc.

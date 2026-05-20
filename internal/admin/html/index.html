@@ -1,0 +1,958 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>kirocc-pro · 管理后台</title>
+  <link rel="stylesheet" href="/admin/assets/style.css">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%230b110d'/%3E%3Crect x='1' y='1' width='30' height='30' rx='4' fill='none' stroke='%2349e08c' stroke-width='1.2'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='ui-monospace,Menlo,monospace' font-size='17' font-weight='700' fill='%2349e08c'%3EK%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <div class="scanline-overlay" aria-hidden="true"></div>
+  <div id="toast" class="toast" hidden></div>
+
+  <div class="layout">
+    <aside class="sidenav">
+      <div class="sidenav-brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div class="sidenav-brand-text">
+          <span class="name">kirocc-pro</span>
+          <span class="page">管理后台</span>
+        </div>
+      </div>
+
+      <nav class="sidenav-tabs" id="tabs">
+        <a href="#/dashboard"  data-tab="dashboard" class="active">
+          <span class="ic" aria-hidden="true">▤</span><span>仪表盘</span>
+        </a>
+        <a href="#/accounts"   data-tab="accounts">
+          <span class="ic" aria-hidden="true">◍</span><span>账号</span>
+        </a>
+        <a href="#/credsfile"  data-tab="credsfile">
+          <span class="ic" aria-hidden="true">⎘</span><span>认证文件</span>
+        </a>
+        <a href="#/stats"      data-tab="stats">
+          <span class="ic" aria-hidden="true">↗</span><span>使用统计</span>
+        </a>
+        <a href="#/settings"   data-tab="settings">
+          <span class="ic" aria-hidden="true">⚙</span><span>系统设置</span>
+        </a>
+        <div class="sidenav-sub" data-parent="settings">
+          <a href="#/settings/runtime"     data-tab="settings" data-section="runtime">运行时</a>
+          <a href="#/settings/auth"        data-tab="settings" data-section="auth">认证密钥</a>
+          <a href="#/settings/remote"      data-tab="settings" data-section="remote">远程访问</a>
+          <a href="#/settings/system"      data-tab="settings" data-section="system">系统</a>
+          <a href="#/settings/network"     data-tab="settings" data-section="network">网络</a>
+          <a href="#/settings/streaming"   data-tab="settings" data-section="streaming">流式传输</a>
+          <a href="#/settings/optimizations" data-tab="settings" data-section="optimizations">kirocc 优化</a>
+          <a href="#/settings/api"           data-tab="settings" data-section="api">远程 API</a>
+        </div>
+      </nav>
+
+      <div class="sidenav-foot">
+        <label class="auto">
+          <input type="checkbox" id="autoToggle">
+          <span>自动刷新</span>
+        </label>
+        <div class="sidenav-foot-row">
+          <button id="refreshAll" class="btn ghost" type="button">↻ 刷新</button>
+          <span id="lastUpdated" class="muted small">—</span>
+        </div>
+        <form method="post" action="/admin/logout" class="sidenav-logout-form">
+          <button class="btn logout" type="submit">退出登录</button>
+        </form>
+      </div>
+    </aside>
+
+    <div class="content">
+      <div id="openModeBanner" class="banner banner-warn" hidden>
+        <strong>未启用密钥认证</strong>
+        <span>所有 /admin/* 路径当前开放访问。启动时设置 <code>-admin-key</code> 或 <code>KIROCC_ADMIN_KEY</code> 启用登录保护。</span>
+      </div>
+
+      <div id="singleModeBanner" class="banner banner-info" hidden>
+        <strong>单账号模式</strong>
+        <span>当前从 Kiro CLI SQLite 读取唯一凭据。要管理多账号，请用 <code>-creds-json</code> 启动并提供一个 JSON 文件路径。</span>
+      </div>
+
+  <main>
+    <!-- ===== 概览 ===== -->
+    <section class="page" data-page="dashboard">
+      <section class="stats" aria-label="账号池状态">
+        <div class="stat-card">
+          <div class="stat-label">总账号</div>
+          <div class="stat-value" id="statAccounts">—</div>
+          <div class="stat-foot muted small" id="statAccountsBreakdown">可用 · 冷却 · 禁用</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">可用</div>
+          <div class="stat-value accent" id="statActive">—</div>
+          <div class="stat-foot muted small">当前可被调度</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">冷却中</div>
+          <div class="stat-value warn" id="statCooldown">—</div>
+          <div class="stat-foot muted small">触发限流</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">已禁用</div>
+          <div class="stat-value dim" id="statDisabled">—</div>
+          <div class="stat-foot muted small">手动或被封</div>
+        </div>
+        <div class="stat-card wide">
+          <div class="stat-label">剩余额度</div>
+          <div class="stat-value mono" id="statCredits">—</div>
+          <div class="stat-foot muted small">所有快照之和</div>
+        </div>
+      </section>
+
+      <section class="stats" aria-label="近 24h 调用">
+        <div class="stat-card">
+          <div class="stat-label">24h 请求</div>
+          <div class="stat-value mono" id="dashReqs">—</div>
+          <div class="stat-foot muted small" id="dashReqsBreak">成功 · 失败</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">24h tokens</div>
+          <div class="stat-value mono accent" id="dashTokens">—</div>
+          <div class="stat-foot muted small" id="dashTokensBreak">输入 · 输出</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">活跃 API 密钥</div>
+          <div class="stat-value mono" id="dashActiveKeys">—</div>
+          <div class="stat-foot muted small">24h 内调用过的 key</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">活跃设备</div>
+          <div class="stat-value mono" id="dashActiveDevices">—</div>
+          <div class="stat-foot muted small">不同设备指纹数</div>
+        </div>
+        <div class="stat-card wide">
+          <div class="stat-label">TOP API key（24h tokens）</div>
+          <div class="stat-value mono" id="dashTopKeyTokens">—</div>
+          <div class="stat-foot muted small" id="dashTopKeyLabel">—</div>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="近期活动">
+        <header class="panel-head">
+          <h2>近 2 小时活动</h2>
+          <span class="muted small" id="timelineRange">—</span>
+        </header>
+        <div class="spark-wrap">
+          <svg id="spark" viewBox="0 0 600 80" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="Token 用量曲线">
+        <header class="panel-head">
+          <h2>Token 用量曲线</h2>
+          <div class="panel-controls">
+            <div class="preset-picker" id="tokenChartRange">
+              <button type="button" class="preset-chip is-active" data-range="24h">24h</button>
+              <button type="button" class="preset-chip" data-range="7d">7d</button>
+              <button type="button" class="preset-chip" data-range="15d">15d</button>
+              <button type="button" class="preset-chip" data-range="30d">30d</button>
+            </div>
+            <span class="muted small" id="tokenChartMeta">—</span>
+          </div>
+        </header>
+        <div class="token-chart-legend">
+          <span class="legend-item legend-input">
+            <span class="legend-swatch"></span>
+            <span>输入 tokens</span>
+            <span class="mono accent" id="tokenChartInputTotal">—</span>
+          </span>
+          <span class="legend-item legend-output">
+            <span class="legend-swatch"></span>
+            <span>输出 tokens</span>
+            <span class="mono" id="tokenChartOutputTotal">—</span>
+          </span>
+          <span class="legend-item">
+            <span>合计</span>
+            <span class="mono" id="tokenChartTotal">—</span>
+          </span>
+        </div>
+        <div class="token-chart-wrap">
+          <svg id="tokenChart" viewBox="0 0 1000 240" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <div class="token-chart-xaxis" id="tokenChartXAxis"></div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ===== 账号 ===== -->
+    <section class="page" data-page="accounts" hidden>
+      <section class="panel" aria-label="账号管理">
+        <header class="panel-head">
+          <h2>账号</h2>
+          <div class="panel-controls" id="accountsActions" hidden>
+            <button class="btn primary" type="button" data-add-provider="kiro">+ 添加 Kiro 账号</button>
+            <button class="btn primary" type="button" data-add-provider="codex">+ 添加 ChatGPT 账号</button>
+            <button class="btn ghost" type="button" id="btnImportAccount">↑ 批量导入 JSON</button>
+            <button class="btn ghost" type="button" id="btnRefreshAllQuota">↻ 刷新全部配额</button>
+            <span class="muted small" id="accountsMeta">—</span>
+          </div>
+        </header>
+        <div class="account-filters" id="accountFilters" hidden>
+          <span class="filter-label">地区</span>
+          <div class="preset-picker" id="accountRegionFilter">
+            <button type="button" class="preset-chip is-active" data-region="">全部</button>
+          </div>
+        </div>
+        <div class="cards" id="accountsCards">
+          <div class="cards-empty muted">加载中…</div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ===== 添加账号 模态对话框（3 选项卡：OAuth / Token-JSON / 本地导入） ===== -->
+    <dialog id="addProviderDialog" class="modal modal-wide">
+      <div class="modal-form">
+        <header class="modal-head">
+          <h2 id="addProviderTitle">添加账号</h2>
+          <button type="button" class="modal-close" data-close-dialog="addProviderDialog" aria-label="关闭">×</button>
+        </header>
+
+        <nav class="tabs tabs-inline" id="addProviderTabs">
+          <a href="#" data-add-tab="oauth" class="active">OAuth 授权</a>
+          <a href="#" data-add-tab="token">Token / JSON</a>
+          <a href="#" data-add-tab="local">本地导入</a>
+        </nav>
+
+        <div class="modal-body">
+          <!-- 1. OAuth 授权 -->
+          <section class="add-tab" data-add-tab-pane="oauth">
+            <p class="muted small">点击下方按钮，在浏览器中完成 <span id="oauthProviderName">Kiro</span> OAuth 授权。授权完成后，此窗口会自动更新。</p>
+            <div class="oauth-block" id="oauthBlock" hidden>
+              <label class="full">
+                <span>授权链接</span>
+                <div class="auth-url-row">
+                  <input type="text" id="oauthAuthURL" readonly>
+                  <button type="button" class="btn ghost" id="btnCopyAuthURL" title="复制链接">复制</button>
+                </div>
+              </label>
+              <div class="oauth-meta muted small">
+                <span>授权有效期：600s</span> · <span>轮询间隔：1s</span> · <span>loopback 端口：<code id="oauthLoopbackPort">—</code></span>
+              </div>
+              <div class="oauth-actions">
+                <button type="button" class="btn primary" id="btnOpenAuthURL">在浏览器中打开</button>
+                <button type="button" class="btn ghost" id="btnManualCallback">手动输入回调地址</button>
+                <button type="button" class="btn" id="btnIveAuthed" disabled>我已授权，继续</button>
+              </div>
+              <div class="oauth-manual" id="oauthManualPanel" hidden>
+                <label class="full">
+                  <span>从浏览器地址栏粘贴回调 URL</span>
+                  <input type="text" id="oauthManualURL" placeholder="http://localhost:1455/auth/callback?code=...&state=...">
+                </label>
+                <div>
+                  <button type="button" class="btn submit" id="btnSubmitManualCallback">提交</button>
+                </div>
+              </div>
+              <div class="oauth-status" id="oauthStatusBox">
+                <span class="oauth-spinner" id="oauthSpinner" hidden></span>
+                <span id="oauthStatusText">等待授权完成...</span>
+              </div>
+            </div>
+            <div class="oauth-start-block" id="oauthStartBlock">
+              <label class="full" style="text-align:left">
+                <span>代理 URL <span class="muted small">（可选 · http://user:pass@host:port 或 socks5://host:port · 留空走默认）</span></span>
+                <input type="text" id="oauthProxyURL" placeholder="http://127.0.0.1:1080">
+              </label>
+              <button type="button" class="btn primary" id="btnStartOAuth" style="margin-top:12px">启动 OAuth 流程</button>
+            </div>
+          </section>
+
+          <!-- 2. Token / JSON -->
+          <section class="add-tab" data-add-tab-pane="token" hidden>
+            <p class="muted small">粘贴您的 Access Token 或导出的 JSON 数据。系统会自动识别格式。</p>
+            <label class="full">
+              <span>Token / JSON 内容</span>
+              <textarea id="addTokenPayload" rows="14" placeholder='可选格式：
+1) 单条凭据 JSON：
+{
+  "id": "kiro-alice",
+  "kiro_auth_token_raw": { "accessToken": "...", "refreshToken": "...", "profileArn": "arn:...", "authMethod": "Social", "region": "us-east-1" }
+}
+2) 顶层数组（多条凭据）
+3) 纯 Access Token（适用于已有 refresh token 与 profile 的简单注入）'></textarea>
+            </label>
+            <div class="modal-actions inline">
+              <button type="button" class="btn submit" id="btnSubmitTokenPayload">导入</button>
+            </div>
+          </section>
+
+          <!-- 3. 本地导入 -->
+          <section class="add-tab" data-add-tab-pane="local" hidden>
+            <p class="muted small">支持从本机 Kiro 客户端 SQLite 或 JSON 文件导入账号数据。</p>
+            <div class="local-block">
+              <div class="local-row" id="localKiroRow">
+                <div>
+                  <strong>从本机 Kiro 客户端导入</strong>
+                  <div class="muted small">读取 Kiro CLI 默认数据库（macOS: ~/Library/Application Support/kiro-cli/data.sqlite3；Linux: ~/.local/share/kiro-cli/data.sqlite3）</div>
+                </div>
+                <button type="button" class="btn primary" id="btnLocalKiroImport">从本机 Kiro 导入</button>
+              </div>
+              <div class="local-row">
+                <div>
+                  <strong>从 JSON 文件导入</strong>
+                  <div class="muted small">支持 cockpit-tools / cli-proxy-api 导出格式（单条或顶层数组）</div>
+                </div>
+                <button type="button" class="btn" id="btnLocalFilePick">选择 JSON 文件</button>
+                <input type="file" id="localFilePicker" accept=".json,application/json" hidden>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <footer class="modal-actions">
+          <button type="button" class="btn ghost" data-close-dialog="addProviderDialog">关闭</button>
+        </footer>
+      </div>
+    </dialog>
+
+    <!-- ===== 导入 JSON 模态对话框 ===== -->
+    <dialog id="importAccountDialog" class="modal">
+      <form method="dialog" class="modal-form" id="importAccountForm">
+        <header class="modal-head">
+          <h2>导入账号</h2>
+          <button type="button" class="modal-close" data-close-dialog="importAccountDialog" aria-label="关闭">×</button>
+        </header>
+        <div class="modal-body">
+          <p class="muted small modal-hint">
+            支持顶层数组或 <code>{"accounts": [...], "mode": "append|replace"}</code> 包装。
+            可以直接粘贴 cockpit-tools / cli-proxy-api 的导出文件。
+          </p>
+          <label class="full">
+            <span>JSON 内容</span>
+            <textarea name="payload" rows="12" placeholder='[
+  {
+    "id": "kiro-x",
+    "label": "x@example.com",
+    "kiro_auth_token_raw": {
+      "accessToken": "...",
+      "refreshToken": "...",
+      "expiresAt": "2026-12-31T00:00:00Z",
+      "profileArn": "arn:...",
+      "authMethod": "Social",
+      "region": "us-east-1"
+    }
+  }
+]'></textarea>
+          </label>
+          <div class="form-row">
+            <label>
+              <span>或从文件读取</span>
+              <input type="file" id="importFile" accept=".json,application/json">
+            </label>
+            <label>
+              <span>模式</span>
+              <select name="mode">
+                <option value="append">追加（跳过已存在 ID）</option>
+                <option value="replace">替换（移除不在列表中的账号）</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <footer class="modal-actions">
+          <button type="button" class="btn ghost" data-close-dialog="importAccountDialog">取消</button>
+          <button type="submit" class="btn submit" value="confirm">导入</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <!-- ===== 添加 API 密钥 ===== -->
+    <dialog id="addAPIKeyDialog" class="modal">
+      <form method="dialog" class="modal-form" id="addAPIKeyForm">
+        <header class="modal-head">
+          <h2>添加 API 密钥</h2>
+          <button type="button" class="modal-close" data-close-dialog="addAPIKeyDialog" aria-label="关闭">×</button>
+        </header>
+        <div class="modal-body">
+          <p class="modal-hint">创建后会一次性展示明文密钥，请立即复制。空白字段含义：<br>
+            <strong>过期时间留空</strong> = 永不过期 ·
+            <strong>额度上限留空 / 0</strong> = 不限制
+          </p>
+          <label class="full">
+            <span>标签 <em>*</em></span>
+            <input type="text" id="newKeyLabel" placeholder="如：alice 笔记本 / 生产环境" required>
+          </label>
+          <label class="full">
+            <span>过期时间</span>
+            <div class="preset-picker" id="newKeyExpiresPicker">
+              <button type="button" class="preset-chip is-active" data-days="0">永不过期</button>
+              <button type="button" class="preset-chip" data-days="7">7 天</button>
+              <button type="button" class="preset-chip" data-days="30">30 天</button>
+              <button type="button" class="preset-chip" data-days="60">60 天</button>
+              <button type="button" class="preset-chip" data-days="90">90 天</button>
+              <button type="button" class="preset-chip" data-days="365">1 年</button>
+              <button type="button" class="preset-chip" data-days="custom">自定义…</button>
+            </div>
+            <input type="datetime-local" id="newKeyExpiresCustom" hidden>
+            <div class="preset-hint" id="newKeyExpiresHint">永不过期</div>
+          </label>
+          <label class="full">
+            <span>额度上限</span>
+            <div class="preset-picker" id="newKeyQuotaPicker">
+              <button type="button" class="preset-chip is-active" data-tokens="0">不限</button>
+              <button type="button" class="preset-chip" data-tokens="100000">100k tokens</button>
+              <button type="button" class="preset-chip" data-tokens="1000000">1M tokens</button>
+              <button type="button" class="preset-chip" data-tokens="10000000">10M tokens</button>
+              <button type="button" class="preset-chip" data-tokens="custom">自定义…</button>
+            </div>
+            <input type="number" id="newKeyQuotaCustom" min="0" step="1000" placeholder="输入 token 数" hidden>
+            <div class="preset-hint" id="newKeyQuotaHint">不限制（input + output tokens）</div>
+          </label>
+        </div>
+        <footer class="modal-actions">
+          <button type="button" class="btn ghost" data-close-dialog="addAPIKeyDialog">取消</button>
+          <button type="submit" class="btn submit">创建</button>
+        </footer>
+      </form>
+    </dialog>
+
+
+    <!-- ===== 认证文件 ===== -->
+    <section class="page" data-page="credsfile" hidden>
+      <div class="credsfile-summary" id="credsFileActions">
+        <div class="credsfile-summary-meta">
+          <div class="label">CREDENTIALS_FILE</div>
+          <code class="path" id="credsPath">—</code>
+          <div class="credsfile-summary-stats">
+            <div><strong id="credsSize">—</strong>bytes</div>
+            <div><strong id="credsMtime">—</strong>last_modified</div>
+            <div><strong id="credsCount">—</strong>entries</div>
+          </div>
+        </div>
+        <div class="credsfile-summary-actions">
+          <button class="btn ghost" type="button" id="btnCredsReload">↻ reload</button>
+          <button class="btn ghost" type="button" id="btnCredsDownload">↓ download</button>
+          <button class="btn ghost" type="button" id="btnCredsUpload">↑ upload</button>
+          <input type="file" id="credsFileUpload" accept=".json,application/json" hidden>
+        </div>
+      </div>
+
+      <div class="creds-grid" id="credsCards">
+        <div class="cards-empty muted">loading…</div>
+      </div>
+
+      <details class="credsfile-raw">
+        <summary>
+          <span class="settings-num">RAW</span>
+          <span class="settings-title">原始 JSON 编辑</span>
+          <span class="settings-sub">高级模式 · 直接编辑文件内容并保存</span>
+        </summary>
+        <div class="credsfile-raw-body">
+          <textarea id="credsEditor" spellcheck="false" rows="20"></textarea>
+          <div class="credsfile-raw-actions">
+            <span class="muted small">写入前会做 JSON schema 校验。</span>
+            <button class="btn primary" type="button" id="btnCredsSave">保存编辑</button>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <!-- ===== 使用统计 ===== -->
+    <section class="page" data-page="stats" hidden>
+      <section class="panel" aria-label="按模型用量">
+        <header class="panel-head">
+          <h2>按模型用量 · 近 24 小时</h2>
+          <span class="muted small" id="usageMeta">—</span>
+        </header>
+        <div class="table-wrap">
+          <table class="data" id="usage">
+            <thead>
+              <tr>
+                <th>模型</th>
+                <th class="num">请求数</th>
+                <th class="num">成功</th>
+                <th class="num">失败</th>
+                <th class="num">输入 token</th>
+                <th class="num">输出 token</th>
+                <th class="num">缓存 读 / 写</th>
+              </tr>
+            </thead>
+            <tbody id="usageBody">
+              <tr class="empty"><td colspan="7" class="muted">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="按 API 密钥">
+        <header class="panel-head">
+          <h2>按 API 密钥 · 近 24 小时</h2>
+          <span class="muted small" id="usageByKeyMeta">—</span>
+        </header>
+        <div class="table-wrap">
+          <table class="data" id="usageByKey">
+            <thead>
+              <tr>
+                <th>标签</th>
+                <th>密钥 ID</th>
+                <th class="num">请求数</th>
+                <th class="num">成功 / 失败</th>
+                <th class="num">输入 token</th>
+                <th class="num">输出 token</th>
+                <th class="num">合计 tokens</th>
+              </tr>
+            </thead>
+            <tbody id="usageByKeyBody">
+              <tr class="empty"><td colspan="7" class="muted">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="按设备">
+        <header class="panel-head">
+          <h2>按设备指纹 · 近 24 小时</h2>
+          <span class="muted small" id="usageByDeviceMeta">—</span>
+        </header>
+        <div class="table-wrap">
+          <table class="data" id="usageByDevice">
+            <thead>
+              <tr>
+                <th>设备指纹</th>
+                <th class="num">请求数</th>
+                <th class="num">成功 / 失败</th>
+                <th class="num">输入 token</th>
+                <th class="num">输出 token</th>
+                <th class="num">合计 tokens</th>
+              </tr>
+            </thead>
+            <tbody id="usageByDeviceBody">
+              <tr class="empty"><td colspan="6" class="muted">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" aria-label="近期请求历史">
+        <header class="panel-head">
+          <h2>近期请求</h2>
+          <div class="panel-controls">
+            <label class="ctrl">
+              <span>状态</span>
+              <select id="recentStatus">
+                <option value="">全部</option>
+                <option value="success">成功</option>
+                <option value="rate_limited">限流</option>
+                <option value="auth_error">认证错误</option>
+                <option value="upstream_error">上游错误</option>
+              </select>
+            </label>
+            <label class="ctrl">
+              <span>数量</span>
+              <select id="recentLimit">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="200">200</option>
+                <option value="500">500</option>
+              </select>
+            </label>
+            <span class="muted small" id="recentMeta">—</span>
+          </div>
+        </header>
+        <div class="table-wrap">
+          <table class="data data-dense" id="recent">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>类型</th>
+                <th>模型</th>
+                <th>状态</th>
+                <th class="num">Tokens</th>
+                <th class="num">额度扣减</th>
+                <th class="num">余额</th>
+                <th class="num">耗时</th>
+                <th>设备</th>
+                <th>Tracking ID</th>
+              </tr>
+            </thead>
+            <tbody id="recentBody">
+              <tr class="empty"><td colspan="10" class="muted">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <!-- ===================== 系统设置 ===================== -->
+    <section class="page" data-page="settings" hidden>
+      <h1 class="page-title">系统设置</h1>
+      <p class="muted">通过 admin UI 修改的运行时配置，立即生效并落盘到 settings.json。启动 flag 仍优先生效。</p>
+
+      <div class="settings-list">
+
+        <section class="settings-card" data-section="runtime">
+          <header class="settings-card-head">
+            <span class="settings-num">01</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">服务器运行时</span>
+              <span class="settings-sub">当前进程实际绑定的地址与端口</span>
+            </div>
+          </header>
+          <div class="settings-body">
+            <dl class="kv-grid">
+              <dt>代理 listen</dt>
+              <dd><code id="srvProxyAddr">—</code></dd>
+              <dt>管理 listen</dt>
+              <dd><code id="srvAdminAddr">—</code></dd>
+              <dt>TLS</dt>
+              <dd id="srvTLSEnabled">—</dd>
+              <dt>公开地址</dt>
+              <dd><code id="srvPublicURL">—</code></dd>
+              <dt>凭据文件</dt>
+              <dd><code id="srvCredsPath">—</code></dd>
+              <dt>账号池模式</dt>
+              <dd id="srvPoolMode">—</dd>
+              <dt>GeoIP</dt>
+              <dd id="srvGeoIP">—</dd>
+            </dl>
+            <p class="settings-hint">由命令行 flag / 环境变量在启动时设定，修改请重启进程。</p>
+          </div>
+        </section>
+
+        <section class="settings-card" data-section="remote">
+          <header class="settings-card-head">
+            <span class="settings-num">02</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">远程管理</span>
+              <span class="settings-sub">远程访问与控制面板设置</span>
+            </div>
+          </header>
+          <div class="settings-body">
+            <label class="check-row">
+              <input type="checkbox" id="cfgAllowRemote">
+              <span>允许远程访问 <span class="muted small">（生效需重启 + 绑定到 0.0.0.0）</span></span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfgDisablePanel">
+              <span>禁用控制面板 <span class="muted small">（仅 JSON API 响应）</span></span>
+            </label>
+            <div class="form-row">
+              <label>管理密钥（mgmt key）</label>
+              <input type="text" id="cfgMgmtKey" placeholder="留空 = 沿用 -admin-key">
+            </div>
+            <div class="form-row">
+              <label>面板仓库</label>
+              <input type="text" id="cfgPanelRepo" placeholder="可选 - 面板源仓库 URL">
+            </div>
+            <button class="btn primary" type="button" data-save="remote_management">保存</button>
+          </div>
+        </section>
+
+        <section class="settings-card" data-section="auth">
+          <header class="settings-card-head">
+            <span class="settings-num">03</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">认证密钥</span>
+              <span class="settings-sub">客户端调用 /v1/messages 用的 API key 列表</span>
+            </div>
+            <button class="btn primary" type="button" id="btnAddAPIKey" style="margin-left:auto">+ 添加密钥</button>
+          </header>
+          <div class="settings-body">
+            <p class="settings-hint">
+              客户端请求 <code>/v1/messages</code> 时在 <code>Authorization: Bearer &lt;key&gt;</code> 携带其中一个未过期且未超额的密钥即可。
+              命令行 <code>-api-key</code> 单值仍向后兼容。
+            </p>
+            <div id="apiKeyRevealBlock" class="reveal-block" hidden>
+              <strong>新密钥已创建</strong>
+              <code id="apiKeyRevealValue"></code>
+              <button class="btn tiny" type="button" id="btnCopyRevealKey">复制</button>
+              <p class="muted small">这是该密钥的唯一一次明文展示。请立即复制保存到客户端 —— 关闭后只能看到掩码。</p>
+            </div>
+            <div class="api-keys-list" id="apiKeysList">
+              <div class="cards-empty muted">尚无 API 密钥</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-card" data-section="system">
+          <header class="settings-card-head">
+            <span class="settings-num">04</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">系统</span>
+              <span class="settings-sub">调试、日志、统计</span>
+            </div>
+          </header>
+          <div class="settings-body">
+            <label class="check-row">
+              <input type="checkbox" id="cfgDebug">
+              <span>调试模式 <span class="muted small">（详细日志，性能开销）</span></span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfgCommercial">
+              <span>商业模式 <span class="muted small">（禁用高开销中间件以支持高并发）</span></span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfgLogToFile">
+              <span>写入日志文件</span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfgUsageStats">
+              <span>采集使用统计</span>
+            </label>
+            <div class="form-row">
+              <label>日志大小上限 (MB) <span class="muted small">0 = 不限</span></label>
+              <input type="number" id="cfgLogMaxMB" min="0">
+            </div>
+            <button class="btn primary" type="button" data-save="system">保存</button>
+          </div>
+        </section>
+
+        <section class="settings-card" data-section="network">
+          <header class="settings-card-head">
+            <span class="settings-num">05</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">网络</span>
+              <span class="settings-sub">代理、重试、路由</span>
+            </div>
+          </header>
+          <div class="settings-body">
+            <div class="form-row">
+              <label>代理 URL</label>
+              <input type="text" id="cfgProxyURL" placeholder="http://127.0.0.1:7890 或 socks5://...">
+            </div>
+            <div class="form-row">
+              <label>请求重试次数</label>
+              <input type="number" id="cfgRequestRetry" min="0" max="20">
+            </div>
+            <div class="form-row">
+              <label>最大重试凭据数 <span class="muted small">0 = 尝试全部</span></label>
+              <input type="number" id="cfgMaxRetryCreds" min="0">
+            </div>
+            <div class="form-row">
+              <label>最大重试间隔</label>
+              <input type="text" id="cfgMaxRetryInterval" placeholder="如 30s, 1m">
+            </div>
+            <div class="form-row">
+              <label>路由策略</label>
+              <select id="cfgRoutingStrategy">
+                <option value="round-robin">轮询 (Round Robin)</option>
+                <option value="fill-first">填满优先 (Fill First)</option>
+                <option value="least-used">最少使用 (Least Used)</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>会话粘性 TTL</label>
+              <input type="text" id="cfgAffinityTTL" placeholder="如 1h, 30m">
+            </div>
+            <div class="form-row">
+              <label>偏好地区 <span class="muted small">GeoIP 未开 / 匹配不到时的兜底</span></label>
+              <input type="text" id="cfgPreferredRegion" placeholder="如 us-east-1，留空 = 无偏好">
+            </div>
+            <label class="check-row">
+              <input type="checkbox" id="cfgForceModelPrefix">
+              <span>强制模型前缀 <span class="muted small">未带前缀的请求只用无前缀凭据</span></span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfgSessionSticky">
+              <span>启用会话粘性路由</span>
+            </label>
+            <button class="btn primary" type="button" data-save="network">保存</button>
+          </div>
+        </section>
+
+        <section class="settings-card" data-section="streaming">
+          <header class="settings-card-head">
+            <span class="settings-num">06</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">流式传输</span>
+              <span class="settings-sub">Keepalive 与 bootstrap 重试</span>
+            </div>
+          </header>
+          <div class="settings-body">
+            <div class="form-row">
+              <label>Keepalive 秒数 <span class="muted small">0 = 禁用</span></label>
+              <input type="number" id="cfgKeepaliveSec" min="0">
+            </div>
+            <div class="form-row">
+              <label>Bootstrap 重试次数</label>
+              <input type="number" id="cfgBootstrapRetries" min="0" max="10">
+            </div>
+            <div class="form-row">
+              <label>非流式 Keepalive 间隔 <span class="muted small">0 = 禁用</span></label>
+              <input type="number" id="cfgNonStreamKeepalive" min="0">
+            </div>
+            <button class="btn primary" type="button" data-save="streaming">保存</button>
+          </div>
+        </section>
+
+        <section class="settings-card" data-section="optimizations">
+          <header class="settings-card-head">
+            <span class="settings-num">07</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">kirocc 优化</span>
+              <span class="settings-sub">代理层在请求 / 响应路径上的修复与可调参数</span>
+            </div>
+          </header>
+          <div class="settings-body">
+            <p class="settings-hint">
+              kirocc 在原始 Anthropic ↔ Kiro 协议转换上叠加了 8 项修复 + 若干实验性开关。下面所有 fix 默认开启（不可关），可调项目前仅通过环境变量配置，本页显示当前生效值。
+            </p>
+
+            <h3 class="opt-section-title">协议修复（Always-On）</h3>
+            <div class="opt-fix-list" id="optFixList">
+              <div class="cards-empty muted">加载中…</div>
+            </div>
+
+            <h3 class="opt-section-title" style="margin-top: 16px">可调参数</h3>
+            <p class="settings-hint">
+              下面的值会保存到 settings.json，下次启动时若对应 <code>KIROCC_*</code> 环境变量未显式设置，将作为默认值生效。环境变量始终优先。
+            </p>
+            <div class="form-row">
+              <label>强制 thinking budget 下限 <span class="muted small">0 = 不强制（KIROCC_FORCE_THINKING_BUDGET）</span></label>
+              <input type="number" id="optForceThinkingBudget" min="0" step="1000" placeholder="如 80000">
+            </div>
+            <div class="form-row">
+              <label>Thinking prompt 模式 <span class="muted small">KIROCC_EXPERIMENT_THINKING_PROMPT</span></label>
+              <select id="optThinkingPromptMode">
+                <option value="">默认（effort-gated）</option>
+                <option value="tool">tool</option>
+                <option value="minimal">minimal</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>Thinking tool 续写 <span class="muted small">KIROCC_EXPERIMENT_THINKING_TOOL_CONTINUE</span></label>
+              <select id="optThinkingToolContinue">
+                <option value="">默认</option>
+                <option value="assistant_only">assistant_only</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>System 模式 <span class="muted small">实验性 · KIROCC_EXPERIMENT_SYSTEM_MODE</span></label>
+              <input type="text" id="optSystemMode" placeholder="留空 = 默认">
+            </div>
+            <div class="form-row">
+              <label>上游 Origin <span class="muted small">KIROCC_UPSTREAM_ORIGIN</span></label>
+              <input type="text" id="optUpstreamOrigin" placeholder="留空 = 不修改">
+            </div>
+            <div class="form-row">
+              <label>模型映射 <span class="muted small">JSON · KIROCC_MODEL_MAPPINGS</span></label>
+              <input type="text" id="optModelMappings" placeholder='如 {"claude-3-5-sonnet":"kiro-..."}'>
+            </div>
+            <div class="form-row">
+              <label>审计日志路径 <span class="muted small">KIROCC_AUDIT_LOG</span></label>
+              <input type="text" id="optAuditLog" placeholder="留空 = 不记录">
+            </div>
+            <button class="btn primary" type="button" data-save="optimizations">保存</button>
+
+            <h3 class="opt-section-title" style="margin-top: 16px">当前生效值</h3>
+            <p class="settings-hint">
+              环境变量 / settings.json 合并后实际生效的值；若一项与上面的输入不同，说明该项被 <code>KIROCC_*=</code> 环境变量覆盖了。
+            </p>
+            <div class="opt-knob-list" id="optKnobList">
+              <div class="cards-empty muted">加载中…</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-card" data-section="api">
+          <header class="settings-card-head">
+            <span class="settings-num">08</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">远程 API</span>
+              <span class="settings-sub">用 curl / 脚本远程加号、刷新、查询的接口示例</span>
+            </div>
+          </header>
+          <div class="settings-body">
+            <p class="settings-hint">
+              管理后台所有接口都在 <code id="apiBaseURL">http://127.0.0.1:3458/admin/*</code> 下。需要在 <code>Authorization: Bearer &lt;admin-key&gt;</code> 携带启动时的 <code>-admin-key</code>。
+              所有 mutating 请求（POST/PUT/PATCH/DELETE）还需要 <code>X-Requested-With: XMLHttpRequest</code> 头以满足 CSRF 中间件。
+            </p>
+
+            <h3 class="opt-section-title">列出账号</h3>
+            <pre class="code-block"><code>curl -H "Authorization: Bearer $KEY" \
+     <span id="apiUrlListAccounts">http://127.0.0.1:3458</span>/admin/accounts | jq</code></pre>
+
+            <h3 class="opt-section-title">添加 Kiro 账号（从已有 token 导入）</h3>
+            <pre class="code-block"><code>curl -X POST \
+     -H "Authorization: Bearer $KEY" \
+     -H "Content-Type: application/json" \
+     -H "X-Requested-With: XMLHttpRequest" \
+     -d '{
+       "id": "kiro-alice",
+       "label": "alice@example.com",
+       "priority": 100,
+       "proxy_url": "http://1.2.3.4:8080",
+       "kiro_auth_token_raw": {
+         "accessToken":  "<paste from cockpit-tools export>",
+         "refreshToken": "<paste from cockpit-tools export>",
+         "expiresAt":    "2026-12-01T00:00:00Z",
+         "profileArn":   "arn:aws:codewhisperer:us-east-1:...:profile/USER_ID",
+         "authMethod":   "Social",
+         "region":       "us-east-1"
+       }
+     }' \
+     <span class="api-url">http://127.0.0.1:3458</span>/admin/accounts</code></pre>
+
+            <h3 class="opt-section-title">批量导入</h3>
+            <pre class="code-block"><code># 用 cockpit-tools 导出的 JSON 文件直接喂：
+curl -X POST \
+     -H "Authorization: Bearer $KEY" \
+     -H "Content-Type: application/json" \
+     -H "X-Requested-With: XMLHttpRequest" \
+     -d "{\"mode\":\"append\",\"accounts\":$(cat credentials.json)}" \
+     <span class="api-url">http://127.0.0.1:3458</span>/admin/accounts/import</code></pre>
+
+            <h3 class="opt-section-title">更新代理 URL</h3>
+            <pre class="code-block"><code>curl -X PATCH \
+     -H "Authorization: Bearer $KEY" \
+     -H "Content-Type: application/json" \
+     -H "X-Requested-With: XMLHttpRequest" \
+     -d '{"proxy_url": "socks5://127.0.0.1:1080"}' \
+     <span class="api-url">http://127.0.0.1:3458</span>/admin/accounts/kiro-alice</code></pre>
+
+            <h3 class="opt-section-title">强制刷新配额</h3>
+            <pre class="code-block"><code>curl -X POST \
+     -H "Authorization: Bearer $KEY" \
+     -H "X-Requested-With: XMLHttpRequest" \
+     <span class="api-url">http://127.0.0.1:3458</span>/admin/accounts/kiro-alice/refresh</code></pre>
+
+            <h3 class="opt-section-title">删除账号</h3>
+            <pre class="code-block"><code>curl -X DELETE \
+     -H "Authorization: Bearer $KEY" \
+     -H "X-Requested-With: XMLHttpRequest" \
+     <span class="api-url">http://127.0.0.1:3458</span>/admin/accounts/kiro-alice</code></pre>
+
+            <h3 class="opt-section-title">Python (requests) 一键示例</h3>
+            <pre class="code-block"><code>import json, requests
+
+BASE = "http://127.0.0.1:3458"
+KEY  = "your-admin-key"
+HEAD = {
+    "Authorization":     f"Bearer {KEY}",
+    "Content-Type":      "application/json",
+    "X-Requested-With":  "XMLHttpRequest",
+}
+
+# 批量导入 cockpit-tools 导出的 credentials.json
+with open("credentials.json") as f:
+    accounts = json.load(f)
+
+r = requests.post(f"{BASE}/admin/accounts/import",
+    headers=HEAD,
+    json={"mode": "append", "accounts": accounts})
+r.raise_for_status()
+print(r.json())  # {"added": N, "skipped": M}</code></pre>
+
+            <p class="settings-hint">
+              提示：admin-key 同时是 web 登录密码，把它写进自动化脚本前请确认环境安全。如果需要更细粒度的 deploy token，告诉我，可以另开 /admin/api-keys-deploy。
+            </p>
+          </div>
+        </section>
+
+      </div>
+    </section>
+  </main>
+
+      <footer class="footer">
+        <span class="muted small">[ kirocc::proxy ] · 127.0.0.1 only · <span id="footStatus">SYS_OK</span></span>
+      </footer>
+    </div><!-- /.content -->
+  </div><!-- /.layout -->
+
+  <script src="/admin/assets/app.js" defer></script>
+</body>
+</html>
