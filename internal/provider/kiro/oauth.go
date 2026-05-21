@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -24,6 +25,13 @@ import (
 	"github.com/niuma/kirocc-pro/internal/pool"
 	"github.com/niuma/kirocc-pro/internal/provider"
 )
+
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
 
 const (
 	authPortalURL = "https://app.kiro.dev/signin"
@@ -154,7 +162,20 @@ func (p *Provider) CompleteOAuth(ctx context.Context, params url.Values, flow *p
 	defer func() { _ = resp.Body.Close() }()
 	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kiro oauth token endpoint returned %d: %s", resp.StatusCode, string(rawBody))
+		// Verbose error: dump exactly what we sent so failures aren't a
+		// black box. code is logged truncated (it's a one-time auth code,
+		// but still leaks if the log file is shared).
+		slog.WarnContext(ctx, "kiro oauth token exchange failed",
+			"status", resp.StatusCode,
+			"endpoint", tokenEndpoint,
+			"redirect_uri", redirectURI,
+			"login_option", loginOption,
+			"captured_path", cbPath,
+			"code_prefix", truncateForLog(code, 8),
+			"code_verifier_len", len(flow.Verifier),
+			"response_body", string(rawBody))
+		return nil, fmt.Errorf("kiro oauth token endpoint returned %d: %s (redirect_uri=%q login_option=%q)",
+			resp.StatusCode, string(rawBody), redirectURI, loginOption)
 	}
 
 	var top map[string]any

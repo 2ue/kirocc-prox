@@ -311,7 +311,7 @@ func (s *SQLiteStore) Query(ctx context.Context, filter Filter, window Window) (
 	where := "WHERE " + strings.Join(clauses, " AND ")
 
 	rowsQ := `SELECT ts, cred_id, resolved_model, input_tokens, output_tokens,
-		cache_read_tokens, cache_write_tokens, status, api_key_id, device_id
+		cache_read_tokens, cache_write_tokens, status, api_key_id, device_id, latency_ms, device
 		FROM usage_records ` + where
 	rows, err := s.db.QueryContext(ctx, rowsQ, args...)
 	if err != nil {
@@ -325,8 +325,10 @@ func (s *SQLiteStore) Query(ctx context.Context, filter Filter, window Window) (
 			credID, model       string
 			in, out, cr, cw     int
 			status, akID, devID string
+			lat                 int
+			device              string
 		)
-		if err := rows.Scan(&ts, &credID, &model, &in, &out, &cr, &cw, &status, &akID, &devID); err != nil {
+		if err := rows.Scan(&ts, &credID, &model, &in, &out, &cr, &cw, &status, &akID, &devID, &lat, &device); err != nil {
 			return agg, fmt.Errorf("scan usage: %w", err)
 		}
 		rec := Record{
@@ -340,6 +342,8 @@ func (s *SQLiteStore) Query(ctx context.Context, filter Filter, window Window) (
 			Status:           status,
 			APIKeyID:         akID,
 			DeviceID:         devID,
+			LatencyMs:        lat,
+			Device:           device,
 		}
 		applyToAggregate(&agg, rec)
 	}
@@ -367,7 +371,9 @@ func (s *SQLiteStore) Query(ctx context.Context, filter Filter, window Window) (
 			SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS succ,
 			SUM(CASE WHEN status != ? THEN 1 ELSE 0 END) AS fail,
 			SUM(input_tokens) AS in_tok,
-			SUM(output_tokens) AS out_tok
+			SUM(output_tokens) AS out_tok,
+			SUM(cache_read_tokens) AS cr_tok,
+			SUM(cache_write_tokens) AS cw_tok
 			FROM usage_records ` + where + ` GROUP BY bucket_idx`
 		tlArgs := []any{startNanos, bucketNanos, StatusSuccess, StatusSuccess}
 		tlArgs = append(tlArgs, args...)
@@ -379,8 +385,8 @@ func (s *SQLiteStore) Query(ctx context.Context, filter Filter, window Window) (
 		defer func() { _ = tlRows.Close() }()
 		for tlRows.Next() {
 			var idx int64
-			var reqs, succ, fail, inTok, outTok int64
-			if err := tlRows.Scan(&idx, &reqs, &succ, &fail, &inTok, &outTok); err != nil {
+			var reqs, succ, fail, inTok, outTok, crTok, cwTok int64
+			if err := tlRows.Scan(&idx, &reqs, &succ, &fail, &inTok, &outTok, &crTok, &cwTok); err != nil {
 				return agg, fmt.Errorf("scan timeline: %w", err)
 			}
 			if idx < 0 || int(idx) >= n {
@@ -392,6 +398,8 @@ func (s *SQLiteStore) Query(ctx context.Context, filter Filter, window Window) (
 			b.Failed = fail
 			b.InputTokens = inTok
 			b.OutputTokens = outTok
+			b.CacheReadTokens = crTok
+			b.CacheWriteTokens = cwTok
 		}
 		if err := tlRows.Err(); err != nil {
 			return agg, fmt.Errorf("iterate timeline: %w", err)

@@ -28,6 +28,13 @@ const retryReasonInvalidToolUse = "invalid_tool_use"
 type retryOutcome struct {
 	Reason           string
 	InvalidToolCalls []respconv.InvalidToolCall
+
+	// TerminalErr carries the raw upstream error string when callAndHandle
+	// failed at the transport layer (e.g. Kiro returned 400 / 429 / 5xx).
+	// Used by executeWithRetry to surface a non-empty errMsg to the
+	// recordMetric closure so usage_records.status reflects the real
+	// outcome instead of "success".
+	TerminalErr string
 }
 
 func (s *Service) handleStreamingResponse(ctx context.Context, w http.ResponseWriter, apiResp *kiroclient.Response, model string, contextWindowSize int, stopSequences []string, maxTokens int, preCountedInputTokens int, capture *upstreamAttemptCapture, toolNameMap map[string]string, tools []anthropic.Tool, retryInvalidToolUse bool) retryOutcome {

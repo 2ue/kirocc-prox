@@ -134,6 +134,34 @@
         </div>
       </section>
 
+      <section class="stats" aria-label="健康与吞吐">
+        <div class="stat-card">
+          <div class="stat-label">平均延迟 (24h)</div>
+          <div class="stat-value mono" id="dashAvgLatency">—</div>
+          <div class="stat-foot muted small">request_weighted</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">错误率 (24h)</div>
+          <div class="stat-value mono" id="dashErrorRate">—</div>
+          <div class="stat-foot muted small" id="dashErrorRateFoot">failed / total</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">RPM</div>
+          <div class="stat-value mono accent" id="dashRPM">—</div>
+          <div class="stat-foot muted small">最近 5 分钟均值</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">TPM</div>
+          <div class="stat-value mono accent" id="dashTPM">—</div>
+          <div class="stat-foot muted small">tokens / minute</div>
+        </div>
+        <div class="stat-card wide">
+          <div class="stat-label">7 天可用率</div>
+          <div class="stat-value mono" id="dashUptime">—</div>
+          <div class="stat-foot muted small" id="dashUptimeFoot">success / total</div>
+        </div>
+      </section>
+
       <section class="panel" aria-label="近期活动">
         <header class="panel-head">
           <h2>近 2 小时活动</h2>
@@ -144,10 +172,14 @@
         </div>
       </section>
 
-      <section class="panel" aria-label="Token 用量曲线">
+      <section class="panel" aria-label="用量趋势">
         <header class="panel-head">
-          <h2>Token 用量曲线</h2>
+          <h2>用量趋势</h2>
           <div class="panel-controls">
+            <div class="preset-picker" id="tokenChartType">
+              <button type="button" class="preset-chip is-active" data-type="tokens">Tokens</button>
+              <button type="button" class="preset-chip" data-type="requests">请求</button>
+            </div>
             <div class="preset-picker" id="tokenChartRange">
               <button type="button" class="preset-chip is-active" data-range="24h">24h</button>
               <button type="button" class="preset-chip" data-range="7d">7d</button>
@@ -157,24 +189,12 @@
             <span class="muted small" id="tokenChartMeta">—</span>
           </div>
         </header>
-        <div class="token-chart-legend">
-          <span class="legend-item legend-input">
-            <span class="legend-swatch"></span>
-            <span>输入 tokens</span>
-            <span class="mono accent" id="tokenChartInputTotal">—</span>
-          </span>
-          <span class="legend-item legend-output">
-            <span class="legend-swatch"></span>
-            <span>输出 tokens</span>
-            <span class="mono" id="tokenChartOutputTotal">—</span>
-          </span>
-          <span class="legend-item">
-            <span>合计</span>
-            <span class="mono" id="tokenChartTotal">—</span>
-          </span>
+        <div class="token-chart-legend" id="tokenChartLegend">
+          <!-- legend items rendered dynamically per chart type -->
         </div>
         <div class="token-chart-wrap">
-          <svg id="tokenChart" viewBox="0 0 1000 240" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <svg id="tokenChart" viewBox="0 0 1000 240" preserveAspectRatio="none"></svg>
+          <div class="token-chart-tooltip" id="tokenChartTooltip" hidden></div>
           <div class="token-chart-xaxis" id="tokenChartXAxis"></div>
         </div>
       </section>
@@ -463,16 +483,15 @@
             <thead>
               <tr>
                 <th>模型</th>
-                <th class="num">请求数</th>
-                <th class="num">成功</th>
-                <th class="num">失败</th>
-                <th class="num">输入 token</th>
-                <th class="num">输出 token</th>
-                <th class="num">缓存 读 / 写</th>
+                <th class="num">请求</th>
+                <th class="num">成功/失败</th>
+                <th class="num">输入</th>
+                <th class="num">输出</th>
+                <th class="num">avg 延迟</th>
               </tr>
             </thead>
             <tbody id="usageBody">
-              <tr class="empty"><td colspan="7" class="muted">加载中…</td></tr>
+              <tr class="empty"><td colspan="6" class="muted">加载中…</td></tr>
             </tbody>
           </table>
         </div>
@@ -489,11 +508,11 @@
               <tr>
                 <th>标签</th>
                 <th>密钥 ID</th>
-                <th class="num">请求数</th>
-                <th class="num">成功 / 失败</th>
-                <th class="num">输入 token</th>
-                <th class="num">输出 token</th>
-                <th class="num">合计 tokens</th>
+                <th class="num">请求</th>
+                <th class="num">成功/失败</th>
+                <th class="num">输入</th>
+                <th class="num">输出</th>
+                <th class="num">avg 延迟</th>
               </tr>
             </thead>
             <tbody id="usageByKeyBody">
@@ -505,31 +524,32 @@
 
       <section class="panel" aria-label="按设备">
         <header class="panel-head">
-          <h2>按设备指纹 · 近 24 小时</h2>
+          <h2>按设备 · 近 24 小时</h2>
           <span class="muted small" id="usageByDeviceMeta">—</span>
         </header>
         <div class="table-wrap">
           <table class="data" id="usageByDevice">
             <thead>
               <tr>
-                <th>设备指纹</th>
-                <th class="num">请求数</th>
-                <th class="num">成功 / 失败</th>
-                <th class="num">输入 token</th>
-                <th class="num">输出 token</th>
-                <th class="num">合计 tokens</th>
+                <th>设备</th>
+                <th>指纹</th>
+                <th class="num">请求</th>
+                <th class="num">成功/失败</th>
+                <th class="num">输入</th>
+                <th class="num">输出</th>
+                <th class="num">avg 延迟</th>
               </tr>
             </thead>
             <tbody id="usageByDeviceBody">
-              <tr class="empty"><td colspan="6" class="muted">加载中…</td></tr>
+              <tr class="empty"><td colspan="7" class="muted">加载中…</td></tr>
             </tbody>
           </table>
         </div>
       </section>
 
-      <section class="panel" aria-label="近期请求历史">
+      <section class="panel" aria-label="请求事件明细">
         <header class="panel-head">
-          <h2>近期请求</h2>
+          <h2>请求事件明细</h2>
           <div class="panel-controls">
             <label class="ctrl">
               <span>状态</span>
@@ -542,14 +562,32 @@
               </select>
             </label>
             <label class="ctrl">
-              <span>数量</span>
+              <span>模型</span>
+              <select id="recentModel"><option value="">全部</option></select>
+            </label>
+            <label class="ctrl">
+              <span>API key</span>
+              <select id="recentKey"><option value="">全部</option></select>
+            </label>
+            <label class="ctrl">
+              <span>拉取上限</span>
               <select id="recentLimit">
-                <option value="50">50</option>
-                <option value="100" selected>100</option>
-                <option value="200">200</option>
-                <option value="500">500</option>
+                <option value="100">100</option>
+                <option value="500" selected>500</option>
+                <option value="1000">1000</option>
               </select>
             </label>
+            <label class="ctrl">
+              <span>每页</span>
+              <select id="recentPageSize">
+                <option value="10" selected>10</option>
+                <option value="20">20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
+            </label>
+            <button class="btn ghost" type="button" id="btnExportCSV">↓ CSV</button>
+            <button class="btn ghost" type="button" id="btnExportJSON">↓ JSON</button>
             <span class="muted small" id="recentMeta">—</span>
           </div>
         </header>
@@ -558,21 +596,32 @@
             <thead>
               <tr>
                 <th>时间</th>
-                <th>类型</th>
                 <th>模型</th>
-                <th>状态</th>
-                <th class="num">Tokens</th>
-                <th class="num">额度扣减</th>
-                <th class="num">余额</th>
-                <th class="num">耗时</th>
+                <th>API key</th>
                 <th>设备</th>
-                <th>Tracking ID</th>
+                <th>状态</th>
+                <th class="num">耗时</th>
+                <th class="num">输入</th>
+                <th class="num">输出</th>
+                <th class="num">合计</th>
               </tr>
             </thead>
             <tbody id="recentBody">
-              <tr class="empty"><td colspan="10" class="muted">加载中…</td></tr>
+              <tr class="empty"><td colspan="9" class="muted">加载中…</td></tr>
             </tbody>
           </table>
+        </div>
+        <div class="pagination" id="recentPagination" hidden>
+          <button class="btn ghost tiny" type="button" id="recentFirst">«</button>
+          <button class="btn ghost tiny" type="button" id="recentPrev">‹</button>
+          <span class="pagination-info" id="recentPageInfo">—</span>
+          <button class="btn ghost tiny" type="button" id="recentNext">›</button>
+          <button class="btn ghost tiny" type="button" id="recentLast">»</button>
+          <span class="pagination-jump">
+            <span class="muted small">跳到</span>
+            <input type="number" id="recentJumpPage" min="1" placeholder="页码">
+            <button class="btn ghost tiny" type="button" id="recentJump">↵</button>
+          </span>
         </div>
       </section>
     </section>

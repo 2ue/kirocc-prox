@@ -117,6 +117,16 @@ func (l *Loopback) CapturedPath() string {
 	return l.capturedPath
 }
 
+// SetCapturedPath lets the admin manual-callback handler seed the
+// captured path from the URL the user pasted, since in that flow the
+// loopback never received the redirect itself. Idempotent: subsequent
+// calls overwrite the prior value.
+func (l *Loopback) SetCapturedPath(p string) {
+	l.pathMu.Lock()
+	defer l.pathMu.Unlock()
+	l.capturedPath = p
+}
+
 // RedirectURI returns the absolute URL the OAuth provider should redirect
 // to (without query string). The OAuth client sends this verbatim in the
 // authorize call.

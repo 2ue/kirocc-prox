@@ -340,45 +340,6 @@ func TestE2E_ImageURL_Skip(t *testing.T) {
 	}
 }
 
-func TestE2E_CacheControl(t *testing.T) {
-	p1 := mustJSON(map[string]string{"content": "ok"})
-	client := &capturingClient{events: []any{"assistantResponseEvent", p1}}
-
-	srv := newE2EServer(t, client)
-	defer srv.Close()
-
-	reqBody := `{
-		"model":"claude-sonnet-4-6",
-		"messages":[
-			{"role":"user","content":[{"type":"text","text":"cached msg","cache_control":{"type":"ephemeral"}}]},
-			{"role":"assistant","content":"reply"},
-			{"role":"user","content":"next"}
-		],
-		"tools":[{"name":"my_tool","description":"A tool","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],
-		"stream":false
-	}`
-	resp := postMessages(t, srv.URL, reqBody)
-	defer func() { _ = resp.Body.Close() }()
-
-	requireStatus(t, resp, 200)
-	requireCaptured(t, client)
-
-	ctx := client.captured.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
-	if ctx == nil {
-		t.Fatal("no context")
-	}
-	hasCachePoint := false
-	for _, te := range ctx.Tools {
-		if te.CachePoint != nil {
-			hasCachePoint = true
-			break
-		}
-	}
-	if !hasCachePoint {
-		t.Fatal("no cache point in tools")
-	}
-}
-
 func TestE2E_LongToolDescription(t *testing.T) {
 	p1 := mustJSON(map[string]string{"content": "ok"})
 	client := &capturingClient{events: []any{"assistantResponseEvent", p1}}

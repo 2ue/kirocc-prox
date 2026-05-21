@@ -115,6 +115,8 @@ func (m *MemoryStore) Query(ctx context.Context, filter Filter, window Window) (
 				}
 				b.InputTokens += int64(rec.InputTokens)
 				b.OutputTokens += int64(rec.OutputTokens)
+				b.CacheReadTokens += int64(rec.CacheReadTokens)
+				b.CacheWriteTokens += int64(rec.CacheWriteTokens)
 			}
 		}
 	}
@@ -227,6 +229,12 @@ func applyToAggregate(agg *Aggregate, rec Record) {
 	}
 	devCell := agg.ByDevice[rec.DeviceID]
 	addToCell(&devCell, rec)
+	// Surface the most-recent User-Agent excerpt as the human-readable
+	// label for this device fingerprint. UA changes between requests
+	// (e.g. version bumps) so we keep the latest observation.
+	if rec.Device != "" {
+		devCell.DeviceLabel = rec.Device
+	}
 	agg.ByDevice[rec.DeviceID] = devCell
 }
 
@@ -241,6 +249,7 @@ func addToCell(cell *CellStats, rec Record) {
 	cell.OutputTokens += int64(rec.OutputTokens)
 	cell.CacheReadTokens += int64(rec.CacheReadTokens)
 	cell.CacheWriteTokens += int64(rec.CacheWriteTokens)
+	cell.TotalLatencyMs += int64(rec.LatencyMs)
 	if rec.Timestamp.After(cell.LastSeenAt) {
 		cell.LastSeenAt = rec.Timestamp
 	}

@@ -188,6 +188,15 @@ func (s *Server) handleOAuthManualCallback(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "callback state does not match request state", http.StatusBadRequest)
 		return
 	}
+	// [fork] Seed the loopback's capturedPath from the pasted URL so
+	// CompleteOAuth can reconstruct the redirect_uri exactly as Kiro
+	// expects at token-exchange (path is provider-chosen, e.g.
+	// "/oauth/callback" for GitHub social, "/oauth/kiro/idc/callback"
+	// for IDC). Without this the manual flow drops the path and Kiro
+	// returns 400 "Bad request".
+	if e.Flow != nil && e.Flow.Loopback != nil && u.Path != "" {
+		e.Flow.Loopback.SetCapturedPath(u.Path)
+	}
 	// Complete the flow synchronously. The loopback watcher (if still
 	// running) will harmlessly time out — closing the loopback here
 	// would race with it, so we let setStatus mark this entry done and

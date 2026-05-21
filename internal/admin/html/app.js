@@ -411,24 +411,29 @@
     const rows = (resp && resp.rows) || [];
     if (rows.length === 0) {
       body.appendChild(el("tr", { class: "empty" },
-        el("td", { colspan: "7", class: "muted" }, "时间窗口内无请求")));
+        el("td", { colspan: "6", class: "muted" }, "时间窗口内无请求")));
       $("usageMeta").textContent = "0 行";
       return;
     }
-    rows.sort((a, b) => b.requests - a.requests);
+    rows.sort((a, b) =>
+      (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens));
     for (const r of rows) {
       body.appendChild(el("tr", {},
         el("td", {}, r.model || "—"),
         el("td", { class: "num mono" }, fmtNum(r.requests)),
-        el("td", { class: "num mono" }, fmtNum(r.success)),
-        el("td", { class: "num mono" }, fmtNum(r.failed)),
+        el("td", { class: "num mono" }, fmtNum(r.success) + " / " + fmtNum(r.failed)),
         el("td", { class: "num mono" }, fmtNum(r.input_tokens)),
         el("td", { class: "num mono" }, fmtNum(r.output_tokens)),
-        el("td", { class: "num mono" },
-          fmtNum(r.cache_read_tokens) + " / " + fmtNum(r.cache_write_tokens)),
+        el("td", { class: "num mono" }, fmtLatency(r.avg_latency_ms || 0)),
       ));
     }
     $("usageMeta").textContent = `${rows.length} 个模型`;
+  }
+
+  function fmtLatency(ms) {
+    if (!ms || ms <= 0) return "—";
+    if (ms >= 1000) return (ms / 1000).toFixed(2) + "s";
+    return Math.round(ms) + "ms";
   }
 
   function renderUsageByKey(resp) {
@@ -445,7 +450,6 @@
     rows.sort((a, b) =>
       (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens));
     for (const r of rows) {
-      const total = (r.input_tokens || 0) + (r.output_tokens || 0);
       body.appendChild(el("tr", {},
         el("td", {}, r.label || "—"),
         el("td", { class: "mono small" }, r.api_key_id || "（legacy）"),
@@ -453,7 +457,7 @@
         el("td", { class: "num mono" }, fmtNum(r.success) + " / " + fmtNum(r.failed)),
         el("td", { class: "num mono" }, fmtNum(r.input_tokens)),
         el("td", { class: "num mono" }, fmtNum(r.output_tokens)),
-        el("td", { class: "num mono accent" }, fmtNum(total)),
+        el("td", { class: "num mono" }, fmtLatency(r.avg_latency_ms || 0)),
       ));
     }
     $("usageByKeyMeta").textContent = `${rows.length} 个密钥在使用`;
@@ -466,21 +470,25 @@
     const rows = (resp && resp.rows) || [];
     if (rows.length === 0) {
       body.appendChild(el("tr", { class: "empty" },
-        el("td", { colspan: "6", class: "muted" }, "时间窗口内无请求")));
+        el("td", { colspan: "7", class: "muted" }, "时间窗口内无请求")));
       $("usageByDeviceMeta").textContent = "0 个设备";
       return;
     }
     rows.sort((a, b) =>
       (b.input_tokens + b.output_tokens) - (a.input_tokens + a.output_tokens));
     for (const r of rows) {
-      const total = (r.input_tokens || 0) + (r.output_tokens || 0);
+      // device = device_id (fingerprint hash); label = UA excerpt set
+      // backend-side from CellStats.DeviceLabel.
+      const fp = r.device || "—";
+      const ua = r.label || "（未知 UA）";
       body.appendChild(el("tr", {},
-        el("td", { class: "mono small" }, r.device || "—"),
+        el("td", {}, ua),
+        el("td", { class: "mono small muted", title: fp }, fp.length > 8 ? fp.slice(0, 8) + "…" : fp),
         el("td", { class: "num mono" }, fmtNum(r.requests)),
         el("td", { class: "num mono" }, fmtNum(r.success) + " / " + fmtNum(r.failed)),
         el("td", { class: "num mono" }, fmtNum(r.input_tokens)),
         el("td", { class: "num mono" }, fmtNum(r.output_tokens)),
-        el("td", { class: "num mono accent" }, fmtNum(total)),
+        el("td", { class: "num mono" }, fmtLatency(r.avg_latency_ms || 0)),
       ));
     }
     $("usageByDeviceMeta").textContent = `${rows.length} 个设备指纹`;
@@ -490,14 +498,21 @@
   // dashboard top row. Independent of the stats page loaders.
   async function loadDashUsage() {
     try {
-      const [byKey, byDevice] = await Promise.all([
+      // group=model gives cost totals; group=api_key/device give active
+      // counts; window=5m sample drives RPM/TPM; window=168h drives
+      // 7-day uptime. Five small queries in parallel.
+      const [byModel, byKey, byDevice, fiveMin, sevenDay] = await Promise.all([
+        getJSON("/admin/usage?window=24h&group=model"),
         getJSON("/admin/usage?window=24h&group=api_key"),
         getJSON("/admin/usage?window=24h&group=device"),
+        getJSON("/admin/usage?window=5m&group=model"),
+        getJSON("/admin/usage?window=168h&group=model"),
       ]);
-      const totals = byKey.totals || {};
+      const totals = byModel.totals || {};
       const setTxt = (id, v) => { const e = $(id); if (e) e.textContent = v; };
       setTxt("dashReqs", fmtNum(totals.requests || 0));
       setTxt("dashReqsBreak", `成功 ${fmtNum(totals.success || 0)} · 失败 ${fmtNum(totals.failed || 0)}`);
+
       const totalTok = (totals.input_tokens || 0) + (totals.output_tokens || 0);
       setTxt("dashTokens", fmtNum(totalTok));
       setTxt("dashTokensBreak", `输入 ${fmtNum(totals.input_tokens || 0)} · 输出 ${fmtNum(totals.output_tokens || 0)}`);
@@ -520,6 +535,40 @@
 
       const devRows = byDevice.rows || [];
       setTxt("dashActiveDevices", devRows.length);
+
+      // Health & throughput cards (24h + 5min + 7day samples)
+      // --- avg latency: rows-weighted mean since we already have avg per row
+      let latSumTokens = 0, latSumWeight = 0;
+      for (const r of (byModel.rows || [])) {
+        if (r.avg_latency_ms > 0) {
+          latSumTokens += r.avg_latency_ms * r.requests;
+          latSumWeight += r.requests;
+        }
+      }
+      const avgLatency = latSumWeight > 0 ? latSumTokens / latSumWeight : 0;
+      setTxt("dashAvgLatency", fmtLatency(avgLatency));
+
+      // --- error rate (24h)
+      const reqsT = totals.requests || 0;
+      const failsT = totals.failed || 0;
+      const errPct = reqsT > 0 ? (failsT / reqsT) * 100 : 0;
+      setTxt("dashErrorRate", reqsT > 0 ? errPct.toFixed(1) + "%" : "—");
+      setTxt("dashErrorRateFoot", `${fmtNum(failsT)} / ${fmtNum(reqsT)}`);
+
+      // --- RPM & TPM (5-minute window averaged)
+      const fmTotals = (fiveMin && fiveMin.totals) || {};
+      const fmReqs = fmTotals.requests || 0;
+      const fmTokens = (fmTotals.input_tokens || 0) + (fmTotals.output_tokens || 0);
+      setTxt("dashRPM", (fmReqs / 5).toFixed(1));
+      setTxt("dashTPM", fmtNum(Math.round(fmTokens / 5)));
+
+      // --- 7d uptime
+      const sdTotals = (sevenDay && sevenDay.totals) || {};
+      const sdReqs = sdTotals.requests || 0;
+      const sdSucc = sdTotals.success || 0;
+      const sdPct = sdReqs > 0 ? (sdSucc / sdReqs) * 100 : 0;
+      setTxt("dashUptime", sdReqs > 0 ? sdPct.toFixed(2) + "%" : "—");
+      setTxt("dashUptimeFoot", `${fmtNum(sdSucc)} / ${fmtNum(sdReqs)}`);
     } catch (e) {
       console.warn("loadDashUsage", e);
     }
@@ -540,58 +589,160 @@
     return id.length > 12 ? id.slice(0, 12) : id;
   }
 
+  // Cached last-fetched rows so export uses the SAME data that's visible.
+  // Pagination is client-side: we keep the full result set in memory and
+  // slice per page on every render. Avoids a server-side cursor for what's
+  // currently a bounded data set (≤1000 rows).
+  let recentLastRows = [];
+  let recentPage = 1;       // 1-indexed
+  let recentPageSize = 10;
+
   function renderRecent(rows) {
+    recentLastRows = rows || [];
+    recentPage = 1;
+    refreshRecentFilterOptions(recentLastRows);
+    renderRecentPage();
+  }
+
+  function renderRecentPage() {
     const body = $("recentBody");
+    const all = recentLastRows;
     body.replaceChildren();
-    if (!rows || rows.length === 0) {
+    if (all.length === 0) {
       body.appendChild(el("tr", { class: "empty" },
-        el("td", { colspan: "10", class: "muted" }, "暂无请求记录")));
+        el("td", { colspan: "11", class: "muted" }, "暂无请求记录")));
       $("recentMeta").textContent = "0 条";
+      $("recentPagination").hidden = true;
       return;
     }
-    // Group records by cred_id so credit-deduction is computed against the
-    // next-older record OF THE SAME CREDENTIAL. rows are already desc by time.
-    const nextSnapshot = new Map(); // cred_id -> next older snapshot value
-    for (let i = rows.length - 1; i >= 0; i--) {
-      const r = rows[i];
-      const prevForCred = nextSnapshot.get(r.credential_id);
-      r._delta = (prevForCred != null && r.credits_used_snapshot > 0 && prevForCred > 0)
-        ? Math.max(0, r.credits_used_snapshot - prevForCred)
-        : null;
-      if (r.credits_used_snapshot > 0) {
-        nextSnapshot.set(r.credential_id, r.credits_used_snapshot);
-      }
-    }
-    for (const r of rows) {
-      const tokens = fmtNum(r.input_tokens) + " / " + fmtNum(r.output_tokens);
-      const deltaCell = (r._delta == null)
-        ? el("td", { class: "num delta-credits zero" }, "—")
-        : el("td", { class: "num delta-credits" }, r._delta.toFixed(2));
 
-      let balCell;
-      if (r.credits_total_snapshot > 0 && r.credits_used_snapshot > 0) {
-        const remaining = Math.max(0, r.credits_total_snapshot - r.credits_used_snapshot);
-        balCell = el("td", { class: "num bal-cell" },
-          remaining.toFixed(1),
-          el("span", { class: "of" }, " / " + r.credits_total_snapshot.toFixed(0)));
-      } else {
-        balCell = el("td", { class: "num bal-cell muted" }, "—");
-      }
+    const pageSize = recentPageSize;
+    const totalPages = Math.max(1, Math.ceil(all.length / pageSize));
+    if (recentPage > totalPages) recentPage = totalPages;
+    if (recentPage < 1) recentPage = 1;
+    const start = (recentPage - 1) * pageSize;
+    const slice = all.slice(start, start + pageSize);
+
+    for (const r of slice) {
+      const total = (r.input_tokens || 0) + (r.output_tokens || 0);
+      const keyDisp = r.api_key_label
+        ? `${r.api_key_label}\n${r.api_key_id?.slice(0, 8) || ''}`
+        : (r.api_key_id ? r.api_key_id.slice(0, 8) : '（legacy）');
 
       body.appendChild(el("tr", {},
         el("td", { class: "mono small" }, fmtTime(r.timestamp)),
-        el("td", {}, r.type || "—"),
-        el("td", { class: "mono" }, r.resolved_model || r.requested_model || "—"),
+        el("td", { class: "mono small" }, r.resolved_model || r.requested_model || "—"),
+        el("td", { class: "mono small", title: r.api_key_id || "" }, keyDisp),
+        el("td", {
+          class: "mono small",
+          title: r.device_id ? `指纹 ${r.device_id}` : "",
+        }, r.device || (r.device_id ? r.device_id.slice(0, 8) : "—")),
         el("td", {}, statusPill(r.status)),
-        el("td", { class: "num mono" }, tokens),
-        deltaCell,
-        balCell,
-        el("td", { class: "num mono" }, r.latency_ms > 0 ? r.latency_ms + " ms" : "—"),
-        el("td", { class: "small muted" }, r.device || "—"),
-        el("td", { class: "trace-id small" }, shortTraceID(r.trace_id)),
+        el("td", { class: "num mono" }, r.latency_ms > 0 ? fmtLatency(r.latency_ms) : "—"),
+        el("td", { class: "num mono" }, fmtNum(r.input_tokens || 0)),
+        el("td", { class: "num mono" }, fmtNum(r.output_tokens || 0)),
+        el("td", { class: "num mono" }, fmtNum(total)),
       ));
     }
-    $("recentMeta").textContent = `${rows.length} 条`;
+
+    // Footer: meta + pagination controls
+    const showFrom = start + 1;
+    const showTo = Math.min(start + pageSize, all.length);
+    $("recentMeta").textContent =
+      `共 ${all.length} 条 · 第 ${showFrom}–${showTo} 条`;
+    const pg = $("recentPagination");
+    pg.hidden = totalPages <= 1;
+    $("recentPageInfo").textContent = `第 ${recentPage} / ${totalPages} 页`;
+    $("recentFirst").disabled = recentPage === 1;
+    $("recentPrev").disabled  = recentPage === 1;
+    $("recentNext").disabled  = recentPage === totalPages;
+    $("recentLast").disabled  = recentPage === totalPages;
+  }
+
+  // Pagination actions
+  function recentGoToPage(p) {
+    const all = recentLastRows;
+    const totalPages = Math.max(1, Math.ceil(all.length / recentPageSize));
+    recentPage = Math.max(1, Math.min(totalPages, p));
+    renderRecentPage();
+  }
+  function recentChangePageSize(size) {
+    const oldFirstIdx = (recentPage - 1) * recentPageSize;
+    recentPageSize = size;
+    // Try to keep approximately the same scroll position by aligning to the
+    // page that contains the previously-first-visible record.
+    recentPage = Math.floor(oldFirstIdx / size) + 1;
+    renderRecentPage();
+  }
+
+  // Refresh dropdown options for model + api_key filters from the current
+  // rows. Preserves the user's current selection if still valid.
+  function refreshRecentFilterOptions(rows) {
+    const modelSet = new Set();
+    const keySet = new Map(); // id → label
+    for (const r of rows) {
+      if (r.resolved_model) modelSet.add(r.resolved_model);
+      if (r.api_key_id) keySet.set(r.api_key_id, r.api_key_label || r.api_key_id);
+    }
+    syncSelect("recentModel", [...modelSet].sort(), (v) => v);
+    syncSelect("recentKey",   [...keySet.entries()].sort(),
+      ([id, _label]) => id,
+      ([_id, label]) => label);
+  }
+
+  function syncSelect(id, items, valueFn, labelFn) {
+    const sel = $(id);
+    if (!sel) return;
+    const prev = sel.value;
+    sel.replaceChildren(el("option", { value: "" }, "全部"));
+    for (const item of items) {
+      sel.appendChild(el("option",
+        { value: valueFn(item) },
+        labelFn ? labelFn(item) : valueFn(item)));
+    }
+    if (prev && [...sel.options].some(o => o.value === prev)) {
+      sel.value = prev;
+    }
+  }
+
+  // CSV export. Wraps fields with quotes; doubles internal quotes per RFC 4180.
+  function exportRecentCSV() {
+    if (recentLastRows.length === 0) { toast("没有数据可导出", "error"); return; }
+    const cols = [
+      "timestamp", "resolved_model", "requested_model", "api_key_id",
+      "api_key_label", "device_id", "device", "status", "latency_ms",
+      "input_tokens", "output_tokens", "credential_id", "trace_id",
+    ];
+    const esc = (v) => {
+      if (v == null) return "";
+      const s = String(v);
+      if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+      return s;
+    };
+    const lines = [cols.join(",")];
+    for (const r of recentLastRows) {
+      lines.push(cols.map(c => esc(r[c])).join(","));
+    }
+    downloadBlob(lines.join("\n") + "\n", "text/csv", "kirocc-events.csv");
+  }
+
+  function exportRecentJSON() {
+    if (recentLastRows.length === 0) { toast("没有数据可导出", "error"); return; }
+    downloadBlob(JSON.stringify(recentLastRows, null, 2),
+      "application/json", "kirocc-events.json");
+  }
+
+  function downloadBlob(content, mime, filename) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast(`已导出 ${filename} (${recentLastRows.length} 条)`, "success");
   }
 
   function renderTimeline(resp) {
@@ -639,21 +790,62 @@
     "15d": { window: "360h", bucket: "12h" },
     "30d": { window: "720h", bucket: "24h" },
   };
-  let tokenChartCurrent = "24h";
+  let tokenChartRangeKey = "24h";
+  let tokenChartType = "tokens";    // tokens | stacked | requests | cost
+  let tokenChartCache = null;       // last fetched timeline response (for type-switch without refetch)
+
+  // CHART_TYPES describes each renderable series set. `series` is an
+  // ordered list of (name, color CSS variable, accessor) tuples; the
+  // renderer either draws them as overlapping lines (tokens / requests)
+  // or as a stacked area chart (stacked / cost). `unit` controls the
+  // y-axis formatter; `legendTotalLabel` decides what label shows
+  // beside the legend total.
+  const CHART_TYPES = {
+    tokens: {
+      // Stack input/output by default — Claude Code traffic typically
+      // has input >> output (often 1000:1), so a non-stacked dual line
+      // chart makes the output line invisible at the X-axis.
+      title: "Tokens（输入/输出堆叠）",
+      stacked: true,
+      unit: "tokens",
+      series: [
+        { name: "输入",  color: "neon",  get: d => d.input_tokens },
+        { name: "输出",  color: "cyan",  get: d => d.output_tokens },
+      ],
+    },
+    requests: {
+      title: "请求数（成功/失败）",
+      stacked: true,
+      unit: "count",
+      series: [
+        { name: "成功", color: "neon",   get: d => d.success },
+        { name: "失败", color: "crimson", get: d => d.failed },
+      ],
+    },
+  };
 
   async function loadTokenChart(rangeKey) {
-    const cfg = TOKEN_CHART_RANGES[rangeKey];
+    const cfg = TOKEN_CHART_RANGES[rangeKey || tokenChartRangeKey];
     if (!cfg) return;
-    tokenChartCurrent = rangeKey;
+    tokenChartRangeKey = rangeKey || tokenChartRangeKey;
     document.querySelectorAll("#tokenChartRange .preset-chip").forEach(b => {
-      b.classList.toggle("is-active", b.dataset.range === rangeKey);
+      b.classList.toggle("is-active", b.dataset.range === tokenChartRangeKey);
     });
     try {
-      const r = await getJSON(`/admin/usage/timeline?window=${cfg.window}&bucket=${cfg.bucket}`);
-      renderTokenChart(r, rangeKey);
+      tokenChartCache = await getJSON(`/admin/usage/timeline?window=${cfg.window}&bucket=${cfg.bucket}`);
+      renderTokenChart(tokenChartCache, tokenChartRangeKey);
     } catch (e) {
       console.warn("loadTokenChart", e);
     }
+  }
+
+  function setTokenChartType(t) {
+    if (!CHART_TYPES[t]) return;
+    tokenChartType = t;
+    document.querySelectorAll("#tokenChartType .preset-chip").forEach(b => {
+      b.classList.toggle("is-active", b.dataset.type === t);
+    });
+    if (tokenChartCache) renderTokenChart(tokenChartCache, tokenChartRangeKey);
   }
 
   function renderTokenChart(resp, rangeKey) {
@@ -662,56 +854,76 @@
     while (svg.firstChild) svg.removeChild(svg.firstChild);
     const data = (resp && resp.timeline) || [];
     const meta = $("tokenChartMeta");
+    const specRaw = CHART_TYPES[tokenChartType];
+
     if (data.length === 0) {
       meta.textContent = "暂无数据";
-      $("tokenChartInputTotal").textContent = "—";
-      $("tokenChartOutputTotal").textContent = "—";
-      $("tokenChartTotal").textContent = "—";
+      renderTokenChartLegend(specRaw, []);
       renderTokenChartXAxis([], rangeKey);
       return;
     }
 
-    // Totals
-    let totalIn = 0, totalOut = 0, peak = 0;
-    for (const d of data) {
-      totalIn += d.input_tokens || 0;
-      totalOut += d.output_tokens || 0;
-      const sum = (d.input_tokens || 0) + (d.output_tokens || 0);
-      if (sum > peak) peak = sum;
+    const spec = specRaw;
+    const seriesValues = spec.series.map(s => data.map(d => s.get(d) || 0));
+    const seriesTotals = seriesValues.map(vals => vals.reduce((a, b) => a + b, 0));
+
+    // If every series is zero, render an empty-state message instead
+    // of a blank chart.
+    if (seriesTotals.every(t => t === 0)) {
+      meta.textContent = `${data.length} 个桶 · ${spec.title} · 无数据`;
+      renderTokenChartLegend(spec, seriesTotals);
+      renderTokenChartXAxis(data, rangeKey);
+      const ns = "http://www.w3.org/2000/svg";
+      const txt = document.createElementNS(ns, "text");
+      txt.setAttribute("x", "500"); txt.setAttribute("y", "120");
+      txt.setAttribute("text-anchor", "middle");
+      txt.setAttribute("class", "axis-label");
+      txt.textContent = `当前窗口内无 ${spec.title} 数据`;
+      svg.appendChild(txt);
+      return;
+    }
+
+    // For stacked charts, peak Y is the per-bucket SUM across series.
+    // For overlapping charts, peak Y is the per-bucket MAX across series.
+    let peak = 0;
+    if (spec.stacked) {
+      for (let i = 0; i < data.length; i++) {
+        let sum = 0;
+        for (let s = 0; s < spec.series.length; s++) sum += seriesValues[s][i];
+        if (sum > peak) peak = sum;
+      }
+    } else {
+      for (let s = 0; s < spec.series.length; s++) {
+        for (const v of seriesValues[s]) if (v > peak) peak = v;
+      }
     }
     const peakY = Math.max(1, peak);
 
     // Geometry
     const W = 1000, H = 240;
-    const padL = 48, padR = 12, padT = 14, padB = 22;
+    const padL = 56, padR = 12, padT = 14, padB = 22;
     const innerW = W - padL - padR;
     const innerH = H - padT - padB;
     const n = data.length;
     const step = n > 1 ? innerW / (n - 1) : 0;
+    const baseY = padT + innerH;
 
     const xy = (i, v) => [
       padL + i * step,
       padT + innerH * (1 - v / peakY),
     ];
 
-    const inputPoints  = data.map((d, i) => xy(i, d.input_tokens || 0));
-    const outputPoints = data.map((d, i) => xy(i, d.output_tokens || 0));
-
     const ns = "http://www.w3.org/2000/svg";
 
-    // Horizontal grid lines (4 evenly spaced bands)
+    // Y grid + labels
     for (let i = 1; i <= 4; i++) {
       const y = padT + (innerH * i) / 5;
       const line = document.createElementNS(ns, "line");
-      line.setAttribute("x1", padL);
-      line.setAttribute("x2", W - padR);
-      line.setAttribute("y1", y);
-      line.setAttribute("y2", y);
+      line.setAttribute("x1", padL); line.setAttribute("x2", W - padR);
+      line.setAttribute("y1", y); line.setAttribute("y2", y);
       line.setAttribute("class", "grid");
       svg.appendChild(line);
     }
-
-    // Y-axis labels
     for (let i = 0; i <= 5; i++) {
       const v = (peakY * (5 - i)) / 5;
       const y = padT + (innerH * i) / 5;
@@ -720,38 +932,177 @@
       txt.setAttribute("y", y + 4);
       txt.setAttribute("text-anchor", "end");
       txt.setAttribute("class", "axis-label");
-      txt.textContent = fmtNum(v);
+      txt.textContent = formatAxisValue(v, spec.unit);
       svg.appendChild(txt);
     }
 
-    const drawSeries = (points, areaCls, lineCls) => {
-      if (points.length === 0) return;
-      const linePath = points
+    // Draw series. For stacked, accumulate Y from the bottom up so each
+    // series sits on top of the previous one. For overlapping, each
+    // series renders independently at the value's height.
+    const accum = new Array(n).fill(0);
+    for (let s = 0; s < spec.series.length; s++) {
+      const ser = spec.series[s];
+      const vals = seriesValues[s];
+      const topPoints = [];
+      const botPoints = [];
+      for (let i = 0; i < n; i++) {
+        const base = spec.stacked ? accum[i] : 0;
+        const top  = spec.stacked ? accum[i] + vals[i] : vals[i];
+        topPoints.push(xy(i, top));
+        botPoints.push(xy(i, base));
+      }
+      if (spec.stacked) for (let i = 0; i < n; i++) accum[i] += vals[i];
+
+      const linePath = topPoints
         .map(([x, y], i) => `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`)
         .join(" ");
-      const last = points[points.length - 1];
-      const first = points[0];
-      const areaPath = linePath + ` L${last[0].toFixed(1)},${(padT + innerH).toFixed(1)} L${first[0].toFixed(1)},${(padT + innerH).toFixed(1)} Z`;
+      const closePath = spec.stacked
+        ? linePath + " " + botPoints.slice().reverse()
+            .map(([x, y]) => `L${x.toFixed(1)},${y.toFixed(1)}`).join(" ") + " Z"
+        : linePath + ` L${topPoints[n - 1][0].toFixed(1)},${baseY.toFixed(1)} L${topPoints[0][0].toFixed(1)},${baseY.toFixed(1)} Z`;
+
       const area = document.createElementNS(ns, "path");
-      area.setAttribute("d", areaPath);
-      area.setAttribute("class", areaCls);
+      area.setAttribute("d", closePath);
+      area.setAttribute("class", "token-area series-" + ser.color);
       svg.appendChild(area);
-      const line = document.createElementNS(ns, "path");
-      line.setAttribute("d", linePath);
-      line.setAttribute("class", lineCls);
-      svg.appendChild(line);
+      if (!spec.stacked) {
+        const line = document.createElementNS(ns, "path");
+        line.setAttribute("d", linePath);
+        line.setAttribute("class", "token-line series-" + ser.color);
+        svg.appendChild(line);
+      }
+    }
+
+    // Hover overlay: one invisible rect per bucket. Hovering shows
+    // a vertical crosshair + populates the tooltip div with bucket
+    // values. Mouseleave clears.
+    const crosshair = document.createElementNS(ns, "line");
+    crosshair.setAttribute("class", "token-crosshair");
+    crosshair.setAttribute("y1", padT);
+    crosshair.setAttribute("y2", baseY);
+    crosshair.setAttribute("x1", -10); crosshair.setAttribute("x2", -10);
+    svg.appendChild(crosshair);
+
+    const overlayW = n > 1 ? step : innerW;
+    for (let i = 0; i < n; i++) {
+      const rect = document.createElementNS(ns, "rect");
+      const cx = padL + i * step;
+      rect.setAttribute("x", (cx - overlayW / 2).toFixed(1));
+      rect.setAttribute("y", padT);
+      rect.setAttribute("width", overlayW.toFixed(1));
+      rect.setAttribute("height", innerH);
+      rect.setAttribute("class", "token-hover-rect");
+      rect.dataset.idx = i;
+      svg.appendChild(rect);
+    }
+    bindTokenChartHover(data, spec, seriesValues, resp.bucket, padL, step, baseY, padT);
+
+    renderTokenChartLegend(spec, seriesTotals);
+    meta.textContent =
+      `${n} 个桶 · 峰值 ${formatAxisValue(peak, spec.unit)}/${resp.bucket} · ${spec.title}`;
+    renderTokenChartXAxis(data, rangeKey);
+  }
+
+  // bindTokenChartHover wires up the SVG-rect overlay -> tooltip flow.
+  // Uses event delegation on the svg so the rects don't all need
+  // individual listeners. Tooltip is positioned in the DOM via px
+  // coords derived from the rect's SVG x + the svg's bounding rect.
+  function bindTokenChartHover(data, spec, seriesValues, bucketStr, padL, step, baseY, padT) {
+    const svg = $("tokenChart");
+    const tip = $("tokenChartTooltip");
+    if (!svg || !tip) return;
+    const crosshair = svg.querySelector(".token-crosshair");
+
+    const onMove = (ev) => {
+      const target = ev.target;
+      if (!target.classList || !target.classList.contains("token-hover-rect")) {
+        return;
+      }
+      const idx = parseInt(target.dataset.idx, 10);
+      if (isNaN(idx) || !data[idx]) return;
+      const d = data[idx];
+      // Crosshair in SVG coords
+      const cxSVG = padL + idx * step;
+      crosshair.setAttribute("x1", cxSVG);
+      crosshair.setAttribute("x2", cxSVG);
+
+      // Tooltip in CSS coords (relative to wrap container)
+      const wrap = svg.parentElement;
+      const wrapRect = wrap.getBoundingClientRect();
+      const svgRect = svg.getBoundingClientRect();
+      // Map SVG x → CSS x via svg's actual rendered width
+      const scaleX = svgRect.width / 1000;
+      const tipX = svgRect.left - wrapRect.left + cxSVG * scaleX;
+
+      // Build tooltip body
+      const lines = [];
+      const t = new Date(d.start);
+      lines.push(`<div class="tip-head">${fmtTipTime(t, bucketStr)}</div>`);
+      const total = spec.series.reduce((sum, _, i) => sum + (seriesValues[i][idx] || 0), 0);
+      for (let s = 0; s < spec.series.length; s++) {
+        const v = seriesValues[s][idx] || 0;
+        lines.push(
+          `<div class="tip-row series-${spec.series[s].color}">` +
+          `<span class="tip-swatch"></span>` +
+          `<span class="tip-name">${spec.series[s].name}</span>` +
+          `<span class="tip-val">${formatAxisValue(v, spec.unit)}</span>` +
+          `</div>`
+        );
+      }
+      if (spec.series.length > 1) {
+        lines.push(`<div class="tip-row tip-total"><span class="tip-name">合计</span><span class="tip-val">${formatAxisValue(total, spec.unit)}</span></div>`);
+      }
+      tip.innerHTML = lines.join("");
+      tip.hidden = false;
+
+      // Position: anchor near top of chart, offset to avoid overflow.
+      const tipW = tip.offsetWidth;
+      const wrapW = wrap.offsetWidth;
+      let left = tipX + 12;
+      if (left + tipW > wrapW) left = tipX - tipW - 12;
+      if (left < 0) left = 4;
+      tip.style.left = left + "px";
+      tip.style.top = "8px";
     };
 
-    drawSeries(outputPoints, "token-area output", "token-line output");
-    drawSeries(inputPoints,  "token-area input",  "token-line input");
+    const onLeave = (ev) => {
+      // Hide tooltip only when leaving the SVG entirely
+      if (ev.relatedTarget && svg.contains(ev.relatedTarget)) return;
+      tip.hidden = true;
+      crosshair.setAttribute("x1", -10);
+      crosshair.setAttribute("x2", -10);
+    };
 
-    // Update legend totals
-    $("tokenChartInputTotal").textContent = fmtNum(totalIn);
-    $("tokenChartOutputTotal").textContent = fmtNum(totalOut);
-    $("tokenChartTotal").textContent = fmtNum(totalIn + totalOut);
-    meta.textContent = `${n} 个桶 · 峰值 ${fmtNum(peak)}/${resp.bucket}`;
+    svg.onmousemove = onMove;
+    svg.onmouseleave = onLeave;
+  }
 
-    renderTokenChartXAxis(data, rangeKey);
+  function fmtTipTime(d, bucketStr) {
+    // Show "M/D HH:MM" — the bucket size is implied by the chart range.
+    const m = d.getMonth() + 1;
+    const day = d.getDate();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${m}/${day} ${hh}:${mm} · ${bucketStr}`;
+  }
+
+  function formatAxisValue(v, _unit) {
+    return fmtNum(v);
+  }
+
+  function renderTokenChartLegend(spec, totals) {
+    const host = $("tokenChartLegend");
+    if (!host) return;
+    host.replaceChildren();
+    for (let i = 0; i < spec.series.length; i++) {
+      const s = spec.series[i];
+      const totVal = totals[i] != null ? totals[i] : 0;
+      host.appendChild(el("span", { class: "legend-item legend-" + s.color },
+        el("span", { class: "legend-swatch" }),
+        el("span", {}, s.name),
+        el("span", { class: "mono accent" }, formatAxisValue(totVal, spec.unit)),
+      ));
+    }
   }
 
   function renderTokenChartXAxis(buckets, rangeKey) {
@@ -883,10 +1234,12 @@
   async function loadTimeline()  { try { renderTimeline(await getJSON("/admin/usage/timeline?bucket=10m&window=2h")); } catch (e) { console.warn(e); } }
   async function loadRecent() {
     try {
-      const lim = $("recentLimit").value || "100";
-      const status = $("recentStatus").value || "";
+      const lim = $("recentLimit").value || "500";
       const params = new URLSearchParams({ limit: lim });
-      if (status) params.set("status", status);
+      const add = (key, id) => { const v = $(id)?.value || ""; if (v) params.set(key, v); };
+      add("status",     "recentStatus");
+      add("model",      "recentModel");
+      add("api_key_id", "recentKey");
       renderRecent(await getJSON("/admin/usage/recent?" + params.toString()));
     } catch (e) { console.warn(e); }
   }
@@ -896,7 +1249,7 @@
     if (currentPage === "dashboard") {
       loadTimeline();
       loadDashUsage();
-      loadTokenChart(tokenChartCurrent);
+      loadTokenChart(tokenChartRangeKey);
     }
     if (currentPage === "accounts")  loadAccounts();
     if (currentPage === "credsfile") loadCredsFile();
@@ -2006,8 +2359,32 @@
   document.addEventListener("DOMContentLoaded", () => {
     $("refreshAll").addEventListener("click", loadAll);
     $("autoToggle").addEventListener("change", (e) => setAuto(e.target.checked));
-    $("recentLimit").addEventListener("change", loadRecent);
-    $("recentStatus").addEventListener("change", loadRecent);
+    $("recentLimit")?.addEventListener("change", loadRecent);
+    $("recentStatus")?.addEventListener("change", loadRecent);
+    $("recentModel")?.addEventListener("change", loadRecent);
+    $("recentKey")?.addEventListener("change", loadRecent);
+    $("btnExportCSV")?.addEventListener("click", exportRecentCSV);
+    $("btnExportJSON")?.addEventListener("click", exportRecentJSON);
+    $("recentPageSize")?.addEventListener("change", (ev) => {
+      recentChangePageSize(parseInt(ev.target.value, 10) || 50);
+    });
+    $("recentFirst")?.addEventListener("click", () => recentGoToPage(1));
+    $("recentPrev")?.addEventListener("click",  () => recentGoToPage(recentPage - 1));
+    $("recentNext")?.addEventListener("click",  () => recentGoToPage(recentPage + 1));
+    $("recentLast")?.addEventListener("click",  () => {
+      const totalPages = Math.max(1, Math.ceil(recentLastRows.length / recentPageSize));
+      recentGoToPage(totalPages);
+    });
+    $("recentJump")?.addEventListener("click", () => {
+      const v = parseInt($("recentJumpPage").value, 10);
+      if (!isNaN(v)) recentGoToPage(v);
+    });
+    $("recentJumpPage")?.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        $("recentJump").click();
+      }
+    });
 
     // Tab routing
     document.querySelectorAll("#tabs a").forEach(a => {
@@ -2089,6 +2466,11 @@
       const b = ev.target.closest(".preset-chip");
       if (!b) return;
       loadTokenChart(b.dataset.range);
+    });
+    $("tokenChartType")?.addEventListener("click", (ev) => {
+      const b = ev.target.closest(".preset-chip");
+      if (!b) return;
+      setTokenChartType(b.dataset.type);
     });
 
     const saved = localStorage.getItem(AUTO_KEY);

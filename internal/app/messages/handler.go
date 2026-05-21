@@ -232,8 +232,8 @@ func (s *Service) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		toolNameMap:       nameMap.ReverseMap(),
 		tools:             req.Tools,
 	}
-	retryCount := s.executeWithRetry(ctx, mw, inv)
-	recordMetric(mw, retryCount, "")
+	retryCount, errMsg := s.executeWithRetry(ctx, mw, inv)
+	recordMetric(mw, retryCount, errMsg)
 }
 
 // logRequest emits the "--> POST /v1/messages" info log summarizing the call.

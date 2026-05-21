@@ -88,11 +88,9 @@ func buildSystemAndTools(req *anthropic.Request, tsCtx *toolsearch.Context, name
 	if tsCtx != nil {
 		// Tool search mode: convert only active tools, inject ToolSearch tool.
 		toolEntries = ConvertTools(tsCtx.ActiveTools, nameMap)
-		toolEntries = ApplyToolCachePoints(tsCtx.ActiveTools, toolEntries)
 		toolEntries = append(toolEntries, toolsearch.KiroToolSearchEntry())
 	} else if len(req.Tools) > 0 {
 		toolEntries = ConvertTools(req.Tools, nameMap)
-		toolEntries = ApplyToolCachePoints(req.Tools, toolEntries)
 	}
 	return systemPrompt, toolEntries
 }

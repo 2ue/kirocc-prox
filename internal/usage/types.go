@@ -116,17 +116,34 @@ type CellStats struct {
 	OutputTokens      int64
 	CacheReadTokens   int64
 	CacheWriteTokens  int64
+	TotalLatencyMs    int64     // sum across all requests; divide by Requests for avg
 	LastSeenAt        time.Time
+
+	// DeviceLabel carries a representative User-Agent excerpt for cells
+	// in Aggregate.ByDevice. Empty on cells keyed by model or api_key
+	// (where it would be meaningless because different UAs map to the
+	// same dimension key).
+	DeviceLabel string
 }
 
 // TimelineBucket is one time-bucket row in Aggregate.Timeline.
 type TimelineBucket struct {
-	Start        time.Time
-	Requests     int64
-	Success      int64
-	Failed       int64
-	InputTokens  int64
-	OutputTokens int64
+	Start            time.Time
+	Requests         int64
+	Success          int64
+	Failed           int64
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+}
+
+// AvgLatencyMs returns the request-weighted average latency.
+func AvgLatencyMs(c CellStats) float64 {
+	if c.Requests <= 0 {
+		return 0
+	}
+	return float64(c.TotalLatencyMs) / float64(c.Requests)
 }
 
 // Store is the persistence layer used by the default Aggregator. Two

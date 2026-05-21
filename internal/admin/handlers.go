@@ -100,17 +100,16 @@ type accountDetail struct {
 // (Model / APIKeyID / Label / Device) are populated depending on the
 // group= query parameter — only the relevant ones are set.
 type usageRow struct {
-	Model            string `json:"model,omitempty"`
-	APIKeyID         string `json:"api_key_id,omitempty"`
-	Label            string `json:"label,omitempty"` // resolved label for api_key group
-	Device           string `json:"device,omitempty"`
-	Requests         int64  `json:"requests"`
-	Success          int64  `json:"success"`
-	Failed           int64  `json:"failed"`
-	InputTokens      int64  `json:"input_tokens"`
-	OutputTokens     int64  `json:"output_tokens"`
-	CacheReadTokens  int64  `json:"cache_read_tokens"`
-	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	Model            string  `json:"model,omitempty"`
+	APIKeyID         string  `json:"api_key_id,omitempty"`
+	Label            string  `json:"label,omitempty"` // resolved label for api_key group
+	Device           string  `json:"device,omitempty"`
+	Requests         int64   `json:"requests"`
+	Success          int64   `json:"success"`
+	Failed           int64   `json:"failed"`
+	AvgLatencyMs     float64 `json:"avg_latency_ms,omitempty"`
+	InputTokens      int64   `json:"input_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
 }
 
 // usageResponse is the envelope around the rolled-up rows.
@@ -513,6 +512,9 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	switch group {
 	case "model":
 		merged := map[string]*usageRow{}
+		// Track per-row pricing model so cost can be computed once at
+		// the end with the fully-aggregated CellStats.
+		merged2 := map[string]usage.CellStats{}
 		for _, byModel := range agg.ByCredModel {
 			for model, cell := range byModel {
 				row := merged[model]
@@ -521,9 +523,14 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 					merged[model] = row
 				}
 				addCellToRow(row, cell)
+				c := merged2[model]
+				addToCellAccum(&c, cell)
+				merged2[model] = c
 			}
 		}
-		for _, row := range merged {
+		for model, row := range merged {
+			c := merged2[model]
+			row.AvgLatencyMs = usage.AvgLatencyMs(c)
 			resp.Rows = append(resp.Rows, *row)
 		}
 	case "api_key":
@@ -535,12 +542,16 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			}
 			row := usageRow{APIKeyID: id, Label: label}
 			addCellToRow(&row, cell)
+			row.AvgLatencyMs = usage.AvgLatencyMs(cell)
+			// Cost can't be inferred without per-row model; leave 0
+			// for the api_key dimension (UI shows it as "—" then).
 			resp.Rows = append(resp.Rows, row)
 		}
 	case "device":
 		for id, cell := range agg.ByDevice {
-			row := usageRow{Device: id}
+			row := usageRow{Device: id, Label: cell.DeviceLabel}
 			addCellToRow(&row, cell)
+			row.AvgLatencyMs = usage.AvgLatencyMs(cell)
 			resp.Rows = append(resp.Rows, row)
 		}
 	default:
@@ -561,10 +572,11 @@ type recentRecordDTO struct {
 	Status               string    `json:"status"`
 	InputTokens          int       `json:"input_tokens"`
 	OutputTokens         int       `json:"output_tokens"`
-	CacheReadTokens      int       `json:"cache_read_tokens"`
-	CacheWriteTokens     int       `json:"cache_write_tokens"`
 	LatencyMs            int       `json:"latency_ms"`
 	Device               string    `json:"device"`
+	DeviceID             string    `json:"device_id,omitempty"`
+	APIKeyID             string    `json:"api_key_id,omitempty"`
+	APIKeyLabel          string    `json:"api_key_label,omitempty"`
 	TraceID              string    `json:"trace_id"`
 	CreditsUsedSnapshot  float64   `json:"credits_used_snapshot"`
 	CreditsTotalSnapshot float64   `json:"credits_total_snapshot"`
@@ -582,6 +594,8 @@ func (s *Server) handleUsageRecent(w http.ResponseWriter, r *http.Request) {
 		CredentialIDs: queryList(q, "cred_id"),
 		Models:        queryList(q, "model"),
 		Statuses:      queryList(q, "status"),
+		APIKeyIDs:     queryList(q, "api_key_id"),
+		DeviceIDs:     queryList(q, "device_id"),
 	}
 	records, err := s.agg.Recent(r.Context(), filter, limit)
 	if err != nil {
@@ -589,6 +603,7 @@ func (s *Server) handleUsageRecent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	labels := s.apiKeyLabels()
 	out := make([]recentRecordDTO, 0, len(records))
 	for _, rec := range records {
 		out = append(out, recentRecordDTO{
@@ -600,10 +615,11 @@ func (s *Server) handleUsageRecent(w http.ResponseWriter, r *http.Request) {
 			Status:               rec.Status,
 			InputTokens:          rec.InputTokens,
 			OutputTokens:         rec.OutputTokens,
-			CacheReadTokens:      rec.CacheReadTokens,
-			CacheWriteTokens:     rec.CacheWriteTokens,
 			LatencyMs:            rec.LatencyMs,
 			Device:               rec.Device,
+			DeviceID:             rec.DeviceID,
+			APIKeyID:             rec.APIKeyID,
+			APIKeyLabel:          labels[rec.APIKeyID],
 			TraceID:              rec.TraceID,
 			CreditsUsedSnapshot:  rec.CreditsUsedSnapshot,
 			CreditsTotalSnapshot: rec.CreditsTotalSnapshot,
@@ -696,8 +712,19 @@ func addCellToRow(row *usageRow, cell usage.CellStats) {
 	row.Failed += cell.Failed
 	row.InputTokens += cell.InputTokens
 	row.OutputTokens += cell.OutputTokens
-	row.CacheReadTokens += cell.CacheReadTokens
-	row.CacheWriteTokens += cell.CacheWriteTokens
+}
+
+// addToCellAccum merges one CellStats into another. Used by the model
+// rollup to also keep a CellStats accumulator alongside the usageRow,
+// so per-model latency can be computed with the full counts at the end
+// of the aggregation loop.
+func addToCellAccum(dst *usage.CellStats, src usage.CellStats) {
+	dst.Requests += src.Requests
+	dst.Success += src.Success
+	dst.Failed += src.Failed
+	dst.InputTokens += src.InputTokens
+	dst.OutputTokens += src.OutputTokens
+	dst.TotalLatencyMs += src.TotalLatencyMs
 }
 
 // apiKeyLabels returns a snapshot of api_key_id → label so the UI can show

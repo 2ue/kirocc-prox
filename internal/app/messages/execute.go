@@ -44,7 +44,11 @@ func (s *Service) callAndHandle(ctx context.Context, w http.ResponseWriter, inv 
 	if err != nil {
 		logUpstreamError(ctx, short, err)
 		httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream API error")
-		return retryOutcome{}
+		// [fork] Propagate the upstream error up so executeWithRetry's
+		// caller can record the real status (rate_limited / auth_error /
+		// upstream_error) in usage_records instead of silently labelling
+		// the request as "success".
+		return retryOutcome{TerminalErr: err.Error()}
 	}
 	body := apiResp.Body
 	defer func() { _ = body.Close() }()
@@ -70,13 +74,19 @@ func (s *Service) callAndHandle(ctx context.Context, w http.ResponseWriter, inv 
 // executeWithRetry runs the invocation and handles retryable invalidStateEvent
 // responses by clearing ConversationID and attempting once more. Terminal error
 // responses are written to w and the function returns. Returns the number of
-// retries performed (0 = first attempt succeeded).
-func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, inv *invocation) int {
+// retries performed and the upstream error message (empty when the call
+// ultimately succeeded — letting the caller record the correct usage status).
+func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, inv *invocation) (int, string) {
 	_, short := logging.TraceIDs(ctx)
 
 	out := s.callAndHandle(ctx, w, inv, 1, true)
-	if out.Reason == "" {
-		return 0
+	if out.Reason == "" && out.TerminalErr == "" {
+		return 0, ""
+	}
+	if out.TerminalErr != "" {
+		// Upstream call itself failed (HTTP layer). No retry — the error
+		// was already written to w by callAndHandle.
+		return 0, out.TerminalErr
 	}
 
 	// [fork] Added in fork (fix #5/#6): two-stage invalid-tool recovery.
@@ -91,16 +101,19 @@ func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, i
 		if err := prepareInvalidToolUseRetry(inv, out.InvalidToolCalls); err != nil {
 			slog.ErrorContext(ctx, "invalid tool retry preparation failed", "trace_id", short, "err", err)
 			httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "invalid tool retry preparation failed")
-			return 1
+			return 1, "invalid tool retry preparation failed"
 		}
 		out2 := s.callAndHandle(ctx, w, inv, 2, false)
-		if out2.Reason == "" {
-			return 1
+		if out2.Reason == "" && out2.TerminalErr == "" {
+			return 1, ""
+		}
+		if out2.TerminalErr != "" {
+			return 1, out2.TerminalErr
 		}
 		if out2.Reason == retryReasonEmptyVisibleEndTurn {
 			slog.ErrorContext(ctx, "invalid tool retry returned empty visible end_turn", "trace_id", short)
 			httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream returned empty response")
-			return 1
+			return 1, "upstream returned empty response"
 		}
 		if out2.Reason == retryReasonInvalidToolUse {
 			slog.ErrorContext(ctx, "invalid tool retry still returned invalid tool_use",
@@ -108,11 +121,11 @@ func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, i
 				"invalid_tool_calls", len(out2.InvalidToolCalls),
 			)
 			writeInvalidToolUseFallback(ctx, w, inv.responseModel, inv.req.Stream, out2.InvalidToolCalls)
-			return 1
+			return 1, "invalid_tool_use_persistent"
 		}
 		slog.ErrorContext(ctx, "invalid tool retry failed", "trace_id", short, "reason", out2.Reason)
 		httpx.WriteError(w, http.StatusBadRequest, errTypeInvalidRequest, "invalid state: "+out2.Reason)
-		return 1
+		return 1, "invalid state: " + out2.Reason
 	}
 
 	slog.WarnContext(ctx, "retrying upstream request",
@@ -124,18 +137,21 @@ func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, i
 	inv.payload.ConversationState.ConversationID = ""
 
 	out2 := s.callAndHandle(ctx, w, inv, 2, true)
-	if out2.Reason == "" {
-		return 1
+	if out2.Reason == "" && out2.TerminalErr == "" {
+		return 1, ""
+	}
+	if out2.TerminalErr != "" {
+		return 1, out2.TerminalErr
 	}
 	if out2.Reason == retryReasonEmptyVisibleEndTurn {
 		slog.ErrorContext(ctx, "retry also returned empty visible end_turn",
 			"trace_id", short, "reason", out2.Reason)
 		httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream returned empty response")
-		return 1
+		return 1, "upstream returned empty response"
 	}
 	// Retry ended with a different (final) error — report it as invalid state.
 	slog.ErrorContext(ctx, "retry failed",
 		"trace_id", short, "first_reason", out.Reason, "second_reason", out2.Reason)
 	httpx.WriteError(w, http.StatusBadRequest, errTypeInvalidRequest, "invalid state: "+out2.Reason)
-	return 1
+	return 1, "invalid state: " + out2.Reason
 }
