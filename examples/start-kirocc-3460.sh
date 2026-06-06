@@ -6,7 +6,7 @@ cd "$ROOT"
 
 : "${KIROCC_HOST:=127.0.0.1}"
 : "${KIROCC_PORT:=3460}"
-: "${KIROCC_API_KEY:=local-kirocc-test-token}"
+: "${KIROCC_API_KEY:=dev-proxy-test-token}"
 : "${KIROCC_EXPERIMENT_THINKING_PROMPT:=minimal}"
 : "${KIROCC_FORCE_THINKING_BUDGET:=100000}"
 : "${KIROCC_UPSTREAM_ORIGIN:=AI_EDITOR}"

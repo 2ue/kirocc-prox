@@ -8,17 +8,17 @@ import (
 	"time"
 )
 
-// writeBufferSize bounds the queue feeding the SQLite worker. A full
-// buffer causes Publish to drop the SQLite write (memory still gets it)
-// and log a warning, so a slow disk never blocks request hot paths.
+// writeBufferSize bounds the queue feeding the persistent store worker. A full
+// buffer causes Publish to drop the persistent write (memory still gets it)
+// and log a warning, so a slow database never blocks request hot paths.
 const writeBufferSize = 4096
 
 // DefaultAggregator pairs a MemoryStore (for fast recent queries) with a
-// SQLiteStore (for arbitrary-window queries). Disk writes are funneled
+// persistent Store (for arbitrary-window queries). Durable writes are funneled
 // through a background worker so Publish stays non-blocking.
 type DefaultAggregator struct {
-	mem *MemoryStore
-	sql *SQLiteStore
+	mem   *MemoryStore
+	store Store
 
 	writes  chan Record
 	done    chan struct{}
@@ -27,16 +27,16 @@ type DefaultAggregator struct {
 	closed  bool
 }
 
-// NewAggregator constructs a DefaultAggregator. Either mem or sql may be
-// nil (but not both); a nil sql disables disk persistence and a nil mem
+// NewAggregator constructs a DefaultAggregator. Either mem or persistent may be
+// nil (but not both); a nil persistent disables durable persistence and a nil mem
 // disables the in-memory fast path.
-func NewAggregator(mem *MemoryStore, sqlStore *SQLiteStore) Aggregator {
+func NewAggregator(mem *MemoryStore, persistent Store) Aggregator {
 	a := &DefaultAggregator{
-		mem:  mem,
-		sql:  sqlStore,
-		done: make(chan struct{}),
+		mem:   mem,
+		store: persistent,
+		done:  make(chan struct{}),
 	}
-	if sqlStore != nil {
+	if persistent != nil {
 		a.writes = make(chan Record, writeBufferSize)
 		a.wg.Add(1)
 		go a.runWriter()
@@ -44,7 +44,7 @@ func NewAggregator(mem *MemoryStore, sqlStore *SQLiteStore) Aggregator {
 	return a
 }
 
-// Publish records r. Memory append happens inline; SQLite append is sent
+// Publish records r. Memory append happens inline; durable append is sent
 // to the worker via a buffered channel. Failures (including a full
 // channel) are logged, never returned.
 func (a *DefaultAggregator) Publish(r Record) {
@@ -62,21 +62,21 @@ func (a *DefaultAggregator) Publish(r Record) {
 	select {
 	case a.writes <- r:
 	default:
-		slog.Warn("usage: sqlite write buffer full, dropping record", "trace_id", r.TraceID)
+		slog.Warn("usage: persistent write buffer full, dropping record", "trace_id", r.TraceID)
 	}
 	a.closeMu.Unlock()
 }
 
 // Query satisfies Aggregator. It prefers the in-memory store when the
 // requested window is fully contained within memory's retained range;
-// otherwise it falls back to SQLite.
+// otherwise it falls back to the persistent store.
 func (a *DefaultAggregator) Query(ctx context.Context, filter Filter, window Window) (Aggregate, error) {
 	useMem := a.mem != nil && a.mem.Len() > 0 && !window.Start.Before(a.mem.Oldest())
 	if useMem {
 		return a.mem.Query(ctx, filter, window)
 	}
-	if a.sql != nil {
-		return a.sql.Query(ctx, filter, window)
+	if a.store != nil {
+		return a.store.Query(ctx, filter, window)
 	}
 	if a.mem != nil {
 		// Memory-only mode, even if the window predates the oldest record.
@@ -86,21 +86,21 @@ func (a *DefaultAggregator) Query(ctx context.Context, filter Filter, window Win
 }
 
 // Recent satisfies Aggregator. Prefers the in-memory store; falls back to
-// SQLite when memory is empty or contains fewer matching records than
-// requested (the SQLite query may surface older history).
+// the persistent store when memory is empty or contains fewer matching records
+// than requested (the persistent query may surface older history).
 func (a *DefaultAggregator) Recent(ctx context.Context, filter Filter, limit int) ([]Record, error) {
 	if a.mem != nil {
 		out, err := a.mem.Recent(ctx, filter, limit)
 		if err != nil {
 			return nil, err
 		}
-		if len(out) >= limit || a.sql == nil {
+		if len(out) >= limit || a.store == nil {
 			return out, nil
 		}
-		// Memory had fewer than requested; supplement from SQLite if
-		// available. SQLite returns the most recent N records globally;
+		// Memory had fewer than requested; supplement from the persistent
+		// store if available. It returns the most recent N records globally;
 		// dedup against what memory already returned.
-		fromSQL, err := a.sql.Recent(ctx, filter, limit)
+		fromSQL, err := a.store.Recent(ctx, filter, limit)
 		if err != nil {
 			return out, nil // best effort
 		}
@@ -119,14 +119,14 @@ func (a *DefaultAggregator) Recent(ctx context.Context, filter Filter, limit int
 		}
 		return out, nil
 	}
-	if a.sql != nil {
-		return a.sql.Recent(ctx, filter, limit)
+	if a.store != nil {
+		return a.store.Recent(ctx, filter, limit)
 	}
 	return nil, errors.New("usage: no store configured")
 }
 
 // Close stops the writer, drains pending records, and closes the
-// SQLite handle.
+// persistent store handle.
 func (a *DefaultAggregator) Close() error {
 	a.closeMu.Lock()
 	if a.closed {
@@ -143,8 +143,8 @@ func (a *DefaultAggregator) Close() error {
 		a.wg.Wait()
 	}
 	close(a.done)
-	if a.sql != nil {
-		return a.sql.Close()
+	if a.store != nil {
+		return a.store.Close()
 	}
 	return nil
 }
@@ -152,8 +152,8 @@ func (a *DefaultAggregator) Close() error {
 func (a *DefaultAggregator) runWriter() {
 	defer a.wg.Done()
 	for rec := range a.writes {
-		if err := a.sql.Append(rec); err != nil {
-			slog.WarnContext(context.Background(), "usage: sqlite append failed",
+		if err := a.store.Append(rec); err != nil {
+			slog.WarnContext(context.Background(), "usage: persistent append failed",
 				"trace_id", rec.TraceID, "err", err)
 		}
 	}

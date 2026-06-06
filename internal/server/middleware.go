@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/niuma/kirocc-pro/internal/authctx"
 	"github.com/niuma/kirocc-pro/internal/dashboard"
@@ -16,6 +17,7 @@ import (
 	"github.com/niuma/kirocc-pro/internal/logging"
 	"github.com/niuma/kirocc-pro/internal/settings"
 	"github.com/niuma/kirocc-pro/internal/tracing"
+	"github.com/niuma/kirocc-pro/internal/usage"
 )
 
 func traceMiddleware(next http.Handler) http.Handler {
@@ -45,6 +47,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		legacyEnabled := s.apiKey != ""
 		dynamicEnabled := s.apiKeyValidator != nil
+		if dynamicEnabled && s.apiKeyValidatorOn != nil {
+			dynamicEnabled = s.apiKeyValidatorOn()
+		}
 		if !legacyEnabled && !dynamicEnabled {
 			next.ServeHTTP(w, r)
 			return
@@ -56,6 +61,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		authHeader := r.Header.Get("Authorization")
 		token, ok := strings.CutPrefix(authHeader, "Bearer ")
 		if !ok {
+			s.recordRejectedMessageUsage(r, usage.StatusAuthError, "invalid API key")
 			httpx.WriteError(w, http.StatusUnauthorized, httpx.ErrTypeAuthentication, "invalid API key")
 			return
 		}
@@ -72,15 +78,53 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			case errors.Is(err, settings.ErrAPIKeyExpired):
+				s.recordRejectedMessageUsage(r, usage.StatusAuthError, "API key expired")
 				httpx.WriteError(w, http.StatusUnauthorized, httpx.ErrTypeAuthentication, "API key expired")
 				return
 			case errors.Is(err, settings.ErrAPIKeyOverQuota):
+				s.recordRejectedMessageUsage(r, usage.StatusRateLimited, "API key over quota")
 				httpx.WriteError(w, http.StatusTooManyRequests, httpx.ErrTypeRateLimit, "API key over quota")
 				return
 			}
 		}
+		s.recordRejectedMessageUsage(r, usage.StatusAuthError, "invalid API key")
 		httpx.WriteError(w, http.StatusUnauthorized, httpx.ErrTypeAuthentication, "invalid API key")
 	})
+}
+
+func (s *Server) recordRejectedMessageUsage(r *http.Request, status, msg string) {
+	if s == nil || s.aggregator == nil || !isMessagesUsagePath(r.URL.Path) {
+		return
+	}
+	s.aggregator.Publish(usage.Record{
+		Timestamp:    time.Now(),
+		Provider:     "kiro",
+		RequestPath:  normalizeProfileRequestPath(r.URL.Path),
+		Status:       status,
+		TraceID:      logging.TraceIDFromContext(r.Context()),
+		ErrorMessage: msg,
+		Device:       summarizeAuthUserAgent(r.Header.Get("User-Agent")),
+		DeviceID:     deviceFingerprint(r),
+	})
+}
+
+func isMessagesUsagePath(path string) bool {
+	path = normalizeProfileRequestPath(path)
+	return path == "/v1/messages" || (strings.HasPrefix(path, "/api/") && strings.HasSuffix(path, "/v1/messages"))
+}
+
+func summarizeAuthUserAgent(ua string) string {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return ""
+	}
+	if i := strings.IndexByte(ua, ' '); i > 0 {
+		ua = ua[:i]
+	}
+	if len(ua) > 64 {
+		ua = ua[:64]
+	}
+	return ua
 }
 
 // corsMiddleware adds CORS headers for localhost origins.

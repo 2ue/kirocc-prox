@@ -22,7 +22,7 @@ import (
 )
 
 // DefaultPollInterval is the wall-clock period between automatic refreshes.
-const DefaultPollInterval = 60 * time.Second
+const DefaultPollInterval = 3 * time.Minute
 
 // DefaultCacheTTL is how long a cached snapshot is considered fresh.
 const DefaultCacheTTL = 60 * time.Second
@@ -67,7 +67,8 @@ type Cache interface {
 //
 // Implementation provided in poller_impl.go.
 type Poller interface {
-	// Run blocks until ctx is cancelled. It performs one immediate refresh,
-	// then ticks every interval.
+	// Run blocks until ctx is cancelled. Enabled pollers perform one immediate
+	// refresh, then tick every interval. A zero-interval poller is disabled and
+	// only waits for ctx cancellation.
 	Run(ctx context.Context)
 }

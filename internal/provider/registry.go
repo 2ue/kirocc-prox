@@ -1,8 +1,12 @@
 package provider
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"sync"
+
+	"github.com/niuma/kirocc-pro/internal/pool"
 )
 
 // ErrUnknownProvider is returned by Registry.Get / RouteFor when no
@@ -99,4 +103,24 @@ func (r *Registry) Len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.ordered)
+}
+
+// FetchQuota dispatches a quota query to the credential's provider. It lets
+// callers such as the automatic quota poller use the same provider-aware path
+// as the admin manual refresh flow, including per-account proxy handling.
+func (r *Registry) FetchQuota(ctx context.Context, cred *pool.Credential) (*pool.KiroQuotaSnapshot, error) {
+	if cred == nil {
+		return nil, fmt.Errorf("provider: nil credential")
+	}
+	cred.Mu.RLock()
+	provID := cred.Provider
+	cred.Mu.RUnlock()
+	if provID == "" {
+		provID = "kiro"
+	}
+	p, err := r.Get(provID)
+	if err != nil {
+		return nil, fmt.Errorf("quota %s: %w", provID, err)
+	}
+	return p.FetchQuota(ctx, cred)
 }

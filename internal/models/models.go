@@ -13,6 +13,7 @@ type Mapping struct {
 	Kiro              string `json:"kiro"`
 	Kiro1M            string `json:"kiro_1m,omitempty"`
 	ContextWindowSize int    `json:"context_window_size,omitzero"` // 0 means use default
+	Hidden            bool   `json:"hidden,omitzero"`              // true keeps aliases resolvable but omits them from /v1/models
 }
 
 const ThinkingSuffix = "[1m]"
@@ -30,10 +31,13 @@ var modelMapOrdered = []Mapping{
 	{Anthropic: "claude-opus-4-7[1m]", Kiro: "claude-opus-4.7", Kiro1M: "claude-opus-4.7"},
 	{Anthropic: "claude-opus-4-6[1m]", Kiro: "claude-opus-4.6", Kiro1M: "claude-opus-4.6"},
 	{Anthropic: "claude-opus-4-7", Kiro: "claude-opus-4.7", Kiro1M: "claude-opus-4.7"},
-	{Anthropic: "claude-sonnet-4-6", Kiro: "claude-sonnet-4.6", Kiro1M: "claude-sonnet-4.6-1m"},
 	{Anthropic: "claude-sonnet-4-5", Kiro: "claude-sonnet-4.5", Kiro1M: "claude-sonnet-4.5-1m"},
 	{Anthropic: "claude-sonnet-4-5-20250929", Kiro: "claude-sonnet-4.5", Kiro1M: "claude-sonnet-4.5-1m"},
 	{Anthropic: "claude-sonnet-4.5", Kiro: "claude-sonnet-4.5", Kiro1M: "claude-sonnet-4.5-1m"},
+	// Kiro currently rejects claude-sonnet-4.6 for real traffic. Keep the
+	// alias resolvable for deployments that override support, but do not
+	// advertise it as a selectable default.
+	{Anthropic: "claude-sonnet-4-6", Kiro: "claude-sonnet-4.6", Kiro1M: "claude-sonnet-4.6-1m", Hidden: true},
 	{Anthropic: "claude-opus-4-6", Kiro: "claude-opus-4.6", Kiro1M: "claude-opus-4.6"},
 	{Anthropic: "claude-opus-4.5", Kiro: "claude-opus-4.5"},
 	{Anthropic: "claude-haiku-4-5", Kiro: "claude-haiku-4.5"},
@@ -41,13 +45,13 @@ var modelMapOrdered = []Mapping{
 	{Anthropic: "claude-haiku-4.5", Kiro: "claude-haiku-4.5"},
 }
 
-const DefaultModel = "claude-sonnet-4.6"
+const DefaultModel = "claude-sonnet-4.5"
 
 // DefaultAnthropicModel is the Anthropic-form ID corresponding to DefaultModel.
 // Returned as the response model for non-claude fallback so callers like
 // Claude Code can map it to a context window size. Kept as a separate constant
 // (not derived from modelMapOrdered) so env overrides cannot poison it.
-const DefaultAnthropicModel = "claude-sonnet-4-6"
+const DefaultAnthropicModel = "claude-sonnet-4-5"
 
 // envCache caches parsed env mappings, re-parsing only when the raw string changes.
 var envCache struct {
@@ -204,6 +208,9 @@ func ListModels() []string {
 	seen := make(map[string]struct{})
 	var result []string
 	for _, m := range effectiveMappings() {
+		if m.Hidden {
+			continue
+		}
 		if _, ok := seen[m.Kiro]; !ok {
 			seen[m.Kiro] = struct{}{}
 			result = append(result, m.Kiro)

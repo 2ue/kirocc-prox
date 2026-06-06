@@ -28,23 +28,26 @@ const retryReasonInvalidToolUse = "invalid_tool_use"
 type retryOutcome struct {
 	Reason           string
 	InvalidToolCalls []respconv.InvalidToolCall
+	RetryCount       int
 
-	// TerminalErr carries the raw upstream error string when callAndHandle
-	// failed at the transport layer (e.g. Kiro returned 400 / 429 / 5xx).
-	// Used by executeWithRetry to surface a non-empty errMsg to the
-	// recordMetric closure so usage_records.status reflects the real
-	// outcome instead of "success".
-	TerminalErr string
+	// TerminalErr carries the upstream error when callAndHandle failed at
+	// the transport layer (for example Kiro returned 400 / 429 / 5xx).
+	// Keeping the error structured lets pool cooldown honor Retry-After.
+	TerminalErr error
 }
 
-func (s *Service) handleStreamingResponse(ctx context.Context, w http.ResponseWriter, apiResp *kiroclient.Response, model string, contextWindowSize int, stopSequences []string, maxTokens int, preCountedInputTokens int, capture *upstreamAttemptCapture, toolNameMap map[string]string, tools []anthropic.Tool, retryInvalidToolUse bool) retryOutcome {
+func (s *Service) handleStreamingResponse(ctx context.Context, w http.ResponseWriter, apiResp *kiroclient.Response, model string, contextWindowSize int, stopSequences []string, maxTokens int, preCountedInputTokens int, capture *upstreamAttemptCapture, toolNameMap map[string]string, tools []anthropic.Tool, cacheAttempt *promptCacheAttempt, retryInvalidToolUse bool) retryOutcome {
 	traceID, short := logging.TraceIDs(ctx)
 
 	gw := NewGateWriter(w)
 	sw := respconv.NewSSEWriter(ctx, gw, model, contextWindowSize, stopSequences, maxTokens, preCountedInputTokens)
-	sw.OnVisibleOutput = func() { gw.Promote() }
+	sw.OnVisibleOutput = func() {
+		markMetricsFirstToken(w)
+		gw.Promote()
+	}
 	sw.SetToolNameMap(toolNameMap)
 	sw.SetToolInputValidator(respconv.NewToolInputValidator(tools))
+	sw.SetUsageAdjuster(cacheAttempt.usageAdjuster())
 
 	var streamErr bool
 	var localStop bool
@@ -148,20 +151,27 @@ func (s *Service) handleStreamingResponse(ctx context.Context, w http.ResponseWr
 			"headers", logging.SafeHeaders{H: gw.Header()},
 		)
 		inputTokens, outputTokens := sw.Usage()
+		rawInputTokens, rawOutputTokens := sw.RawUsage()
 		pct := resolveContextPercent(sw.ContextUsagePercentage(), sw.HasContextUsage(), inputTokens, contextWindowSize)
 		logResponseStats(ctx, short, inputTokens, outputTokens, sw.HasContextUsage(), sw.ContextUsagePercentage(), contextWindowSize)
 		if mw, ok := w.(*metricsResponseWriter); ok {
-			mw.setUsage(inputTokens, outputTokens, pct)
+			mw.setUsageDetailed(
+				inputTokens, outputTokens, sw.FinalCacheReadInputTokens(), sw.FinalCacheWriteInputTokens(),
+				rawInputTokens, rawOutputTokens, sw.RawCacheReadInputTokens(), sw.RawCacheWriteInputTokens(),
+				pct,
+			)
 		}
+		cacheAttempt.commitIfApplied()
 	}
 	return retryOutcome{}
 }
 
-func (s *Service) handleNonStreamingResponse(ctx context.Context, w http.ResponseWriter, apiResp *kiroclient.Response, model string, contextWindowSize int, stopSequences []string, maxTokens int, preCountedInputTokens int, capture *upstreamAttemptCapture, toolNameMap map[string]string, tools []anthropic.Tool, retryInvalidToolUse bool) retryOutcome {
+func (s *Service) handleNonStreamingResponse(ctx context.Context, w http.ResponseWriter, apiResp *kiroclient.Response, model string, contextWindowSize int, stopSequences []string, maxTokens int, preCountedInputTokens int, capture *upstreamAttemptCapture, toolNameMap map[string]string, tools []anthropic.Tool, cacheAttempt *promptCacheAttempt, retryInvalidToolUse bool) retryOutcome {
 	traceID, short := logging.TraceIDs(ctx)
 	acc := respconv.NewNonStreamingAccumulator(contextWindowSize, stopSequences, maxTokens, preCountedInputTokens)
 	acc.SetToolNameMap(toolNameMap)
 	acc.SetToolInputValidator(respconv.NewToolInputValidator(tools))
+	acc.SetUsageAdjuster(cacheAttempt.usageAdjuster())
 
 	var invalidReason string
 	var hasError bool
@@ -169,6 +179,7 @@ func (s *Service) handleNonStreamingResponse(ctx context.Context, w http.Respons
 	err := kiroproto.ParseStream(ctx, apiResp.Body, func(e kiroproto.Event) bool {
 		capture.recordEvent(e)
 		d := acc.ProcessEvent(e)
+		markMetricsFirstTokenForDelta(w, d)
 		if d.IsError {
 			hasError = true
 			switch e.Type {
@@ -237,12 +248,20 @@ func (s *Service) handleNonStreamingResponse(ctx context.Context, w http.Respons
 		return retryOutcome{}
 	}
 	_, _ = w.Write([]byte("\n"))
+	if content, ok := resp["content"].([]any); ok && len(content) > 0 {
+		markMetricsFirstToken(w)
+	}
 
 	logResponseStats(ctx, short, stats.InputTokens, stats.OutputTokens, stats.HasContextUsage, stats.ContextUsagePercentage, contextWindowSize)
 	if mw, ok := w.(*metricsResponseWriter); ok {
 		pct := resolveContextPercent(stats.ContextUsagePercentage, stats.HasContextUsage, stats.InputTokens, contextWindowSize)
-		mw.setUsage(stats.InputTokens, stats.OutputTokens, pct)
+		mw.setUsageDetailed(
+			stats.InputTokens, stats.OutputTokens, stats.CacheReadInputTokens, stats.CacheWriteInputTokens,
+			stats.RawInputTokens, stats.RawOutputTokens, stats.RawCacheReadTokens, stats.RawCacheWriteTokens,
+			pct,
+		)
 	}
+	cacheAttempt.commitIfApplied()
 	return retryOutcome{}
 }
 

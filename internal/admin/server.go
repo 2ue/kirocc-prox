@@ -35,35 +35,34 @@ const DefaultPort = 3457
 //
 // It is safe to call Start once. Subsequent calls return an error.
 type Server struct {
-	host      string
-	port      int
-	adminKey  string // empty = no auth required (open mode)
-	credsPath string // empty = single-account mode; mutation endpoints return 405
+	host     string
+	port     int
+	adminKey string // empty = no auth required (open mode)
 
 	sched         pool.Scheduler
 	agg           usage.Aggregator
 	cache         quota.Cache
-	registry      *provider.Registry // optional; nil = report empty provider list
-	oauthCache    *oauth.StateCache  // optional; nil = OAuth endpoints return 503
-	publicBaseURL string             // optional; overrides Host header in redirect_uri
-	proxyBaseURL  string             // optional; advertised in /admin/config/cc-switch
-	proxyAPIKey   string             // optional; surfaced in cc-switch config (masked elsewhere)
-	tlsCert       string             // optional; PEM file path, enables HTTPS when paired with tlsKey
-	tlsKey        string             // optional; PEM file path
-	oauthFlows    *oauthFlowRegistry // in-flight OAuth flows (state → entry)
-	settings      *settings.Store    // optional; nil disables /admin/settings + /admin/api-keys
-	refresher     pool.Refresher     // optional; lets manual refresh recover from expired access tokens
-	geoResolver   *georegion.Resolver // optional; surfaces GeoIP status in /admin/settings
+	registry      *provider.Registry   // optional; nil = report empty provider list
+	oauthCache    *oauth.StateCache    // optional; nil = OAuth endpoints return 503
+	publicBaseURL string               // optional; overrides Host header in redirect_uri
+	proxyBaseURL  string               // optional; advertised in /admin/config/cc-switch
+	proxyAPIKey   string               // optional; surfaced in cc-switch config (masked elsewhere)
+	tlsCert       string               // optional; PEM file path, enables HTTPS when paired with tlsKey
+	tlsKey        string               // optional; PEM file path
+	oauthFlows    *oauthFlowRegistry   // in-flight OAuth flows (state → entry)
+	settings      *settings.Store      // optional; nil disables /admin/settings + /admin/api-keys
+	refresher     pool.Refresher       // optional; lets manual refresh recover from expired access tokens
+	geoResolver   *georegion.Resolver  // optional; surfaces GeoIP status in /admin/settings
+	credStore     pool.CredentialStore // durable account store; PostgreSQL in production
 
 	srv *http.Server
 }
 
 // NewServer constructs an admin server. Pass empty host / zero port to use
 // the defaults. adminKey enables session-cookie + Bearer-header auth; pass
-// "" to keep all /admin/* paths open (useful only on loopback). credsPath
-// is the on-disk JSON credentials file used by the multi-account pool;
-// pass "" for single-account mode (mutation endpoints will refuse with 405).
-func NewServer(host string, port int, adminKey, credsPath string, sched pool.Scheduler, agg usage.Aggregator, cache quota.Cache) *Server {
+// "" to keep all /admin/* paths open (useful only on loopback). Account
+// mutations require SetCredentialStore; the production store is PostgreSQL.
+func NewServer(host string, port int, adminKey string, sched pool.Scheduler, agg usage.Aggregator, cache quota.Cache) *Server {
 	if host == "" {
 		host = DefaultHost
 	}
@@ -74,7 +73,6 @@ func NewServer(host string, port int, adminKey, credsPath string, sched pool.Sch
 		host:       host,
 		port:       port,
 		adminKey:   adminKey,
-		credsPath:  credsPath,
 		sched:      sched,
 		agg:        agg,
 		cache:      cache,
@@ -122,6 +120,8 @@ func (s *Server) SetTLS(certPath, keyPath string) {
 // SetSettings attaches the runtime-mutable settings store. Pass nil to
 // disable /admin/settings and /admin/api-keys endpoints.
 func (s *Server) SetSettings(store *settings.Store) { s.settings = store }
+
+func (s *Server) SetCredentialStore(store pool.CredentialStore) { s.credStore = store }
 
 // SetRefresher attaches the pool refresher used by manual quota refresh to
 // recover from expired OAuth access tokens. Pass nil to disable the
@@ -232,7 +232,6 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /admin/oauth/start", s.handleOAuthStart)
 	mux.HandleFunc("GET /admin/oauth/status", s.handleOAuthStatus)
 	mux.HandleFunc("POST /admin/oauth/manual_callback", s.handleOAuthManualCallback)
-	mux.HandleFunc("POST /admin/import/local-kiro", s.handleLocalKiroImport)
 	mux.HandleFunc("GET /admin/config/cc-switch", s.handleCCSwitchConfig)
 
 	// Settings (runtime-mutable config) + multi API key list.
@@ -245,8 +244,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /admin/api-keys/{id}/rotate", s.handleAPIKeyRotate)
 	mux.HandleFunc("DELETE /admin/api-keys/{id}", s.handleAPIKeyDelete)
 
-	// Credentials file editor (multi-account mode only).
-	s.routeCredsFile(mux)
+	// Removed in the PostgreSQL architecture; keep explicit tombstones so old
+	// API clients don't get the SPA fallback and assume the file editor exists.
+	mux.HandleFunc("GET /admin/credsfile", s.handleRemovedCredsFile)
+	mux.HandleFunc("PUT /admin/credsfile", s.handleRemovedCredsFile)
+	mux.HandleFunc("GET /admin/credsfile/download", s.handleRemovedCredsFile)
 
 	// HTML / static.
 	mux.HandleFunc("GET /admin", s.handleIndex)
@@ -254,4 +256,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /admin/assets/", s.handleAssets)
 
 	return s.authMiddleware(mux)
+}
+
+func (s *Server) handleRemovedCredsFile(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "credentials file API removed; accounts are stored in PostgreSQL", http.StatusGone)
 }

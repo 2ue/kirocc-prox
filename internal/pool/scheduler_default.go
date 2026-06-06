@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"sort"
@@ -12,9 +13,12 @@ import (
 // credential map with a sync.RWMutex; per-credential mutation is delegated
 // to the credential's own Mu (see locking discipline on Credential).
 type DefaultScheduler struct {
-	mu    sync.RWMutex
-	creds map[string]*Credential
-	order []string // insertion order for deterministic iteration in All()
+	mu            sync.RWMutex
+	creds         map[string]*Credential
+	order         []string // insertion order for deterministic iteration in All()
+	nextRuntimeID uint64
+	runtime       RuntimeStateStore
+	store         CredentialStore
 }
 
 // NewDefaultScheduler creates an empty DefaultScheduler.
@@ -22,6 +26,33 @@ func NewDefaultScheduler() *DefaultScheduler {
 	return &DefaultScheduler{
 		creds: make(map[string]*Credential),
 	}
+}
+
+// SetRuntimeState attaches the distributed runtime state store used to mirror
+// cooldown changes to Redis. The scheduler still keeps an in-process snapshot
+// for admin views and local fallback behavior.
+func (s *DefaultScheduler) SetRuntimeState(r RuntimeStateStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runtime = r
+}
+
+func (s *DefaultScheduler) runtimeState() RuntimeStateStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.runtime
+}
+
+func (s *DefaultScheduler) SetCredentialStore(store CredentialStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store = store
+}
+
+func (s *DefaultScheduler) credentialStore() CredentialStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.store
 }
 
 // Register replaces the pool with the given credentials. Runtime state on
@@ -37,8 +68,14 @@ func (s *DefaultScheduler) Register(creds []*Credential) {
 		if c == nil || c.ID == "" {
 			continue
 		}
-		if old, ok := s.creds[c.ID]; ok && old != c {
-			copyRuntimeState(old, c)
+		if old, ok := s.creds[c.ID]; ok {
+			c.runtimeID = old.runtimeID
+			if old != c {
+				copyRuntimeState(old, c)
+			}
+		} else {
+			c.runtimeID = s.nextRuntimeID + 1
+			s.nextRuntimeID++
 		}
 		next[c.ID] = c
 		order = append(order, c.ID)
@@ -47,7 +84,11 @@ func (s *DefaultScheduler) Register(creds []*Credential) {
 	s.order = order
 }
 
-// copyRuntimeState transfers runtime fields (state below Mu) from src to dst.
+// copyRuntimeState transfers runtime fields from src to dst. In-flight counters
+// are copied so a creds reload does not temporarily over-admit requests for
+// the same credential ID. DefaultConductor.Release releases through the
+// scheduler, so stale pre-reload requests decrement the current credential
+// object only when it is the same scheduler identity.
 // Both credentials are locked while the copy happens.
 func copyRuntimeState(src, dst *Credential) {
 	src.Mu.RLock()
@@ -58,6 +99,7 @@ func copyRuntimeState(src, dst *Credential) {
 	dst.Quota = src.Quota
 	dst.Success = src.Success
 	dst.Failed = src.Failed
+	dst.InFlight = src.InFlight
 	dst.LastUsedAt = src.LastUsedAt
 	dst.Disabled = src.Disabled
 	dst.DisabledReason = src.DisabledReason
@@ -73,7 +115,38 @@ func copyRuntimeState(src, dst *Credential) {
 			cp := *ms
 			dst.ModelStates[k] = &cp
 		}
+	} else {
+		dst.ModelStates = nil
 	}
+	if len(src.InFlightByModel) > 0 {
+		dst.InFlightByModel = make(map[string]int64, len(src.InFlightByModel))
+		for k, n := range src.InFlightByModel {
+			dst.InFlightByModel[k] = n
+		}
+	} else {
+		dst.InFlightByModel = nil
+	}
+}
+
+// ReleaseReservation releases a reservation against the currently registered
+// successor for cred. It holds the scheduler lock while selecting the current
+// object so concurrent Register calls cannot swap the credential between
+// lookup and release. The runtimeID check prevents a stale request for a
+// removed account from decrementing a later, unrelated account that reused
+// the same configured ID.
+func (s *DefaultScheduler) ReleaseReservation(cred *Credential, model string) bool {
+	if cred == nil {
+		return false
+	}
+	s.mu.RLock()
+	c := s.creds[cred.ID]
+	if c != nil && c.runtimeID == cred.runtimeID {
+		c.ReleaseReservation(model)
+	} else {
+		c = nil
+	}
+	s.mu.RUnlock()
+	return c != nil
 }
 
 // Ready returns credentials sorted by Priority descending (stable sort).
@@ -90,7 +163,7 @@ func (s *DefaultScheduler) Ready() []*Credential {
 
 	ready := make([]*Credential, 0, len(all))
 	for _, c := range all {
-		if c.IsReady() {
+		if c.IsReadyFor("") {
 			ready = append(ready, c)
 		}
 	}
@@ -127,8 +200,6 @@ func (s *DefaultScheduler) MarkSuccess(credID, model string, u Usage) {
 		return
 	}
 	c.Mu.Lock()
-	defer c.Mu.Unlock()
-
 	c.Quota.Exceeded = false
 	c.Quota.BackoffLevel = 0
 	c.Quota.NextRecoverAt = time.Time{}
@@ -142,6 +213,10 @@ func (s *DefaultScheduler) MarkSuccess(credID, model string, u Usage) {
 		ms.Quota.NextRecoverAt = time.Time{}
 		ms.Success++
 	}
+	c.Mu.Unlock()
+	if rt := s.runtimeState(); rt != nil {
+		_ = rt.ClearCooldown(context.Background(), credID, model)
+	}
 }
 
 // MarkRateLimit records a 429 / quota error. Schedules cooldown via NextBackoff
@@ -153,8 +228,6 @@ func (s *DefaultScheduler) MarkRateLimit(credID, model string, retryAfter time.D
 		return
 	}
 	c.Mu.Lock()
-	defer c.Mu.Unlock()
-
 	c.Failed++
 
 	if c.DisableCooling {
@@ -163,6 +236,7 @@ func (s *DefaultScheduler) MarkRateLimit(credID, model string, retryAfter time.D
 			ms := ensureModelStateLocked(c, model)
 			ms.Failed++
 		}
+		c.Mu.Unlock()
 		return
 	}
 
@@ -175,13 +249,22 @@ func (s *DefaultScheduler) MarkRateLimit(credID, model string, retryAfter time.D
 		"cred", credID, "model", model,
 		"duration", d, "level", c.Quota.BackoffLevel)
 
+	modelCooldown := time.Duration(0)
 	if model != "" {
 		ms := ensureModelStateLocked(c, model)
 		md := NextBackoff(ms.Quota.BackoffLevel, retryAfter)
+		modelCooldown = md
 		ms.Quota.Exceeded = true
 		ms.Quota.NextRecoverAt = time.Now().Add(md)
 		ms.Quota.BackoffLevel++
 		ms.Failed++
+	}
+	c.Mu.Unlock()
+	if rt := s.runtimeState(); rt != nil {
+		_ = rt.SetCooldown(context.Background(), credID, "", d)
+		if model != "" && modelCooldown > 0 {
+			_ = rt.SetCooldown(context.Background(), credID, model, modelCooldown)
+		}
 	}
 }
 
@@ -192,11 +275,15 @@ func (s *DefaultScheduler) MarkAuthError(credID, reason string) {
 		return
 	}
 	c.Mu.Lock()
-	defer c.Mu.Unlock()
 	c.Disabled = true
 	c.DisabledReason = reason
 	c.DisabledAt = time.Now()
+	c.Mu.Unlock()
 	slog.Warn("pool: credential disabled by auth error", "cred", credID, "reason", reason)
+	if rt := s.runtimeState(); rt != nil {
+		_ = rt.SetCooldown(context.Background(), credID, "", 24*time.Hour)
+	}
+	s.persistCredentialAsync(c)
 }
 
 // RefreshQuota updates the cached Kiro usage snapshot. If banned, also marks
@@ -224,6 +311,7 @@ func (s *DefaultScheduler) RefreshQuota(credID string, snap *KiroQuotaSnapshot) 
 	if banned {
 		s.MarkAuthError(credID, reason)
 	}
+	s.persistCredentialAsync(c)
 }
 
 // RecordQuotaError stores a fetch failure without disabling the credential.
@@ -233,9 +321,10 @@ func (s *DefaultScheduler) RecordQuotaError(credID string, errMsg string) {
 		return
 	}
 	c.Mu.Lock()
-	defer c.Mu.Unlock()
 	c.LastQuotaError = errMsg
 	c.LastQuotaErrorAt = time.Now()
+	c.Mu.Unlock()
+	s.persistCredentialAsync(c)
 }
 
 // SetEnabled toggles the operator-disabled flag.
@@ -245,7 +334,6 @@ func (s *DefaultScheduler) SetEnabled(credID string, enabled bool) error {
 		return ErrCredentialNotFound
 	}
 	c.Mu.Lock()
-	defer c.Mu.Unlock()
 	if enabled {
 		c.Disabled = false
 		c.DisabledReason = ""
@@ -253,13 +341,32 @@ func (s *DefaultScheduler) SetEnabled(credID string, enabled bool) error {
 		c.Quota.BackoffLevel = 0
 		c.Quota.Exceeded = false
 		c.Quota.NextRecoverAt = time.Time{}
+		c.Mu.Unlock()
+		if rt := s.runtimeState(); rt != nil {
+			_ = rt.ClearCooldown(context.Background(), credID, "")
+		}
+		s.persistCredentialAsync(c)
 		return nil
 	}
 	c.Disabled = true
 	if c.DisabledAt.IsZero() {
 		c.DisabledAt = time.Now()
 	}
+	c.Mu.Unlock()
+	s.persistCredentialAsync(c)
 	return nil
+}
+
+func (s *DefaultScheduler) persistCredentialAsync(c *Credential) {
+	store := s.credentialStore()
+	if store == nil || c == nil {
+		return
+	}
+	go func() {
+		if err := store.SaveOne(context.Background(), c); err != nil {
+			slog.Warn("pool: persist credential state failed", "cred", c.ID, "err", err)
+		}
+	}()
 }
 
 // Add inserts a fresh credential into the pool. Returns ErrDuplicateID
@@ -273,6 +380,8 @@ func (s *DefaultScheduler) Add(cred *Credential) error {
 	if _, ok := s.creds[cred.ID]; ok {
 		return ErrDuplicateID
 	}
+	cred.runtimeID = s.nextRuntimeID + 1
+	s.nextRuntimeID++
 	s.creds[cred.ID] = cred
 	s.order = append(s.order, cred.ID)
 	return nil

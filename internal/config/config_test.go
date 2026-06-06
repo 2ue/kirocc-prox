@@ -86,36 +86,6 @@ func TestApplyBool(t *testing.T) {
 	}
 }
 
-func TestDefaultDBPathFor(t *testing.T) {
-	tests := []struct {
-		name string
-		goos string
-		home string
-		want string
-	}{
-		{
-			name: "darwin",
-			goos: "darwin",
-			home: "/Users/dkuro",
-			want: "/Users/dkuro/Library/Application Support/kiro-cli/data.sqlite3",
-		},
-		{
-			name: "linux",
-			goos: "linux",
-			home: "/home/dkuro",
-			want: "/home/dkuro/.local/share/kiro-cli/data.sqlite3",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := DefaultDBPathFor(tt.goos, tt.home); got != tt.want {
-				t.Fatalf("DefaultDBPathFor(%q, %q) = %q, want %q", tt.goos, tt.home, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestApplyEnvOverrides_LogFields(t *testing.T) {
 	t.Setenv("KIROCC_LOG_FILE", "/tmp/test.log")
 	t.Setenv("KIROCC_LOG_MAX_SIZE", "50")
@@ -155,6 +125,9 @@ func TestConfig_Validate(t *testing.T) {
 		wantErr bool
 	}{
 		{"valid defaults", Config{Host: "127.0.0.1", Port: 3456}, false},
+		{"valid least inflight strategy", Config{Host: "127.0.0.1", Port: 3456, PoolStrategy: "least-inflight"}, false},
+		{"valid weighted least inflight strategy", Config{Host: "127.0.0.1", Port: 3456, PoolStrategy: "weighted-least-inflight"}, false},
+		{"invalid pool strategy", Config{Host: "127.0.0.1", Port: 3456, PoolStrategy: "bogus"}, true},
 		{"empty host", Config{Port: 3456}, true},
 		{"port zero", Config{Host: "127.0.0.1", Port: 0}, true},
 		{"port negative", Config{Host: "127.0.0.1", Port: -1}, true},
@@ -168,5 +141,38 @@ func TestConfig_Validate(t *testing.T) {
 				t.Errorf("Validate() err = %v, wantErr = %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestParsePromptCacheReportsRejectsDuplicateNormalizedRoutes(t *testing.T) {
+	_, err := ParsePromptCacheReports(`{
+		"routes": {
+			"custom-a": "custom-a",
+			"/api/custom-a": "profile-b"
+		},
+		"profiles": {
+			"custom-a": {"enabled": true},
+			"profile-b": {"enabled": true}
+		}
+	}`)
+	if err == nil {
+		t.Fatal("expected duplicate normalized route error")
+	}
+}
+
+func TestParsePromptCacheReportsNormalizesCustomRoutes(t *testing.T) {
+	cfg, err := ParsePromptCacheReports(`{
+		"routes": {
+			"custom-a": "custom-a"
+		},
+		"profiles": {
+			"custom-a": {"enabled": true}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("ParsePromptCacheReports: %v", err)
+	}
+	if _, ok := cfg.Routes["/api/custom-a"]; !ok {
+		t.Fatalf("routes = %+v, want /api/custom-a", cfg.Routes)
 	}
 }

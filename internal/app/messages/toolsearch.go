@@ -3,12 +3,14 @@ package messages
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/niuma/kirocc-pro/internal/anthropic"
 	"github.com/niuma/kirocc-pro/internal/auth"
 	"github.com/niuma/kirocc-pro/internal/httpx"
@@ -17,7 +19,6 @@ import (
 	"github.com/niuma/kirocc-pro/internal/reqconv"
 	"github.com/niuma/kirocc-pro/internal/respconv"
 	"github.com/niuma/kirocc-pro/internal/toolsearch"
-	"github.com/google/uuid"
 )
 
 const maxToolSearchRounds = 3
@@ -31,28 +32,35 @@ type toolSearchOrchestrator struct {
 	buildOpts         reqconv.BuildOptions
 	contextWindowSize int
 	responseModel     string
+	inv               *invocation
 }
 
 // run dispatches to the streaming or non-streaming implementation based on
-// req.Stream. Returns retryReasonEmptyVisibleEndTurn when the upstream
-// produced thinking-only output and the call site should retry.
-func (o *toolSearchOrchestrator) run(ctx context.Context, w http.ResponseWriter) string {
+// req.Stream. It returns structured outcome data so the caller can update
+// scheduler cooldowns and local metrics consistently with the normal path.
+func (o *toolSearchOrchestrator) run(ctx context.Context, w http.ResponseWriter) retryOutcome {
 	if o.req.Stream {
 		return o.handleStreaming(ctx, w)
 	}
 	return o.handleNonStreaming(ctx, w)
 }
 
-func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.ResponseWriter) string {
+func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.ResponseWriter) retryOutcome {
 	_, short := logging.TraceIDs(ctx)
 
 	gw := NewGateWriter(w)
 	sw := respconv.NewSSEWriter(ctx, gw, o.responseModel, o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, 0)
-	sw.OnVisibleOutput = func() { gw.Promote() }
+	sw.OnVisibleOutput = func() {
+		markMetricsFirstToken(w)
+		gw.Promote()
+	}
 
 	msgs := slices.Clone(o.req.Messages)
 
 	var cumulativeInputTokens, cumulativeOutputTokens int
+	var cumulativeRawInputTokens, cumulativeRawOutputTokens int
+	var cumulativeRawCacheReadTokens, cumulativeRawCacheWriteTokens int
+	var lastCacheAttempt *promptCacheAttempt
 	// [fork] Added in fork (fix #5/#6/#7): invalidToolRetried gates the
 	// one-shot invalid-tool reflow inside the ToolSearch round loop. Without
 	// this, a malformed ToolSearch tool_use would either loop forever or
@@ -65,7 +73,7 @@ func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.Res
 		if err != nil {
 			slog.WarnContext(ctx, "tool search payload build error", "trace_id", short, "err", err)
 			writeStreamingOrJSONError(gw, sw, w, http.StatusBadRequest, errTypeInvalidRequest, err.Error())
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 		sw.SetToolNameMap(nameMap.ReverseMap())
 		sw.SetToolInputValidator(respconv.NewToolInputValidator(o.tsCtx.ActiveTools))
@@ -74,17 +82,25 @@ func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.Res
 		if err != nil {
 			logUpstreamError(ctx, short, err, "round", round+1)
 			writeStreamingOrJSONError(gw, sw, w, http.StatusBadGateway, errTypeAPI, "upstream API error")
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 
 		if round > 0 {
 			// Accumulate usage from previous round before resetting.
 			in, out := sw.Usage()
+			rawIn, rawOut := sw.RawUsage()
 			cumulativeInputTokens += in
 			cumulativeOutputTokens += out
-			sw.ResetAccumulator(o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, 0)
+			cumulativeRawInputTokens += rawIn
+			cumulativeRawOutputTokens += rawOut
+			cumulativeRawCacheReadTokens += sw.RawCacheReadInputTokens()
+			cumulativeRawCacheWriteTokens += sw.RawCacheWriteInputTokens()
 		}
+		sw.ResetAccumulator(o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, apiResp.PromptTokens)
 		sw.SetDropToolName(toolsearch.KiroToolSearchName)
+		cacheAttempt := o.service.promptCacheAttempt(o.inv, apiResp.PromptTokens)
+		lastCacheAttempt = cacheAttempt
+		sw.SetUsageAdjuster(cacheAttempt.usageAdjuster())
 
 		var foundToolSearch bool
 		var toolSearchInput string
@@ -123,7 +139,7 @@ func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.Res
 		if err != nil && !foundToolSearch {
 			slog.ErrorContext(ctx, "stream error", "trace_id", short, "round", round+1, "err", err)
 			writeStreamingOrJSONError(gw, sw, w, http.StatusBadGateway, errTypeAPI, "upstream stream error")
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 
 		if !foundToolSearch {
@@ -136,7 +152,7 @@ func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.Res
 						"invalid_tool_calls", len(calls),
 					)
 					writeInvalidToolUseFallback(ctx, w, o.responseModel, true, calls)
-					return ""
+					return retryOutcome{TerminalErr: errors.New("invalid_tool_use_persistent")}
 				}
 				gw.Discard()
 				slog.WarnContext(ctx, "retrying tool search after invalid tool_use",
@@ -157,7 +173,7 @@ func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.Res
 			if !streamErr && !localStop && sw.IsEmptyVisibleEndTurn() && !gw.IsPromoted() {
 				gw.Discard()
 				slog.WarnContext(ctx, "empty visible end_turn detected in tool search", "trace_id", short)
-				return retryReasonEmptyVisibleEndTurn
+				return retryOutcome{Reason: retryReasonEmptyVisibleEndTurn}
 			}
 			if streamErr && !gw.IsPromoted() {
 				gw.Discard()
@@ -165,9 +181,26 @@ func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.Res
 			}
 			if !streamErr {
 				inputTokens, outputTokens := sw.Usage()
+				rawInputTokens, rawOutputTokens := sw.RawUsage()
 				logResponseStats(ctx, short, inputTokens+cumulativeInputTokens, outputTokens+cumulativeOutputTokens, sw.HasContextUsage(), sw.ContextUsagePercentage(), o.contextWindowSize)
+				if mw, ok := w.(*metricsResponseWriter); ok {
+					pct := resolveContextPercent(sw.ContextUsagePercentage(), sw.HasContextUsage(), inputTokens+cumulativeInputTokens, o.contextWindowSize)
+					mw.setUsageDetailed(
+						inputTokens+cumulativeInputTokens,
+						outputTokens+cumulativeOutputTokens,
+						sw.FinalCacheReadInputTokens(),
+						sw.FinalCacheWriteInputTokens(),
+						rawInputTokens+cumulativeRawInputTokens,
+						rawOutputTokens+cumulativeRawOutputTokens,
+						sw.RawCacheReadInputTokens()+cumulativeRawCacheReadTokens,
+						sw.RawCacheWriteInputTokens()+cumulativeRawCacheWriteTokens,
+						pct,
+					)
+				}
+				cacheAttempt.commitIfApplied()
+				return retryOutcome{}
 			}
-			return ""
+			return retryOutcome{TerminalErr: errors.New("upstream stream error")}
 		}
 
 		// ToolSearch detected — execute search and emit SSE blocks.
@@ -200,17 +233,36 @@ func (o *toolSearchOrchestrator) handleStreaming(ctx context.Context, w http.Res
 	slog.WarnContext(ctx, "tool search max rounds reached", "trace_id", short, "max_rounds", maxToolSearchRounds)
 	sw.Finish()
 	inputTokens, outputTokens := sw.Usage()
+	rawInputTokens, rawOutputTokens := sw.RawUsage()
 	logResponseStats(ctx, short, inputTokens+cumulativeInputTokens, outputTokens+cumulativeOutputTokens, sw.HasContextUsage(), sw.ContextUsagePercentage(), o.contextWindowSize)
-	return ""
+	if mw, ok := w.(*metricsResponseWriter); ok {
+		pct := resolveContextPercent(sw.ContextUsagePercentage(), sw.HasContextUsage(), inputTokens+cumulativeInputTokens, o.contextWindowSize)
+		mw.setUsageDetailed(
+			inputTokens+cumulativeInputTokens,
+			outputTokens+cumulativeOutputTokens,
+			sw.FinalCacheReadInputTokens(),
+			sw.FinalCacheWriteInputTokens(),
+			rawInputTokens+cumulativeRawInputTokens,
+			rawOutputTokens+cumulativeRawOutputTokens,
+			sw.RawCacheReadInputTokens()+cumulativeRawCacheReadTokens,
+			sw.RawCacheWriteInputTokens()+cumulativeRawCacheWriteTokens,
+			pct,
+		)
+	}
+	lastCacheAttempt.commitIfApplied()
+	return retryOutcome{}
 }
 
-func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.ResponseWriter) string {
+func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.ResponseWriter) retryOutcome {
 	_, short := logging.TraceIDs(ctx)
 
 	msgs := slices.Clone(o.req.Messages)
 
 	var orderedBlocks []any
 	var totalInputTokens, totalOutputTokens int
+	var totalCacheReadTokens, totalCacheWriteTokens int
+	var totalRawInputTokens, totalRawOutputTokens int
+	var totalRawCacheReadTokens, totalRawCacheWriteTokens int
 	var lastStopReason string
 	var lastStopSequence any
 
@@ -221,17 +273,17 @@ func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.
 		payload, nameMap, err := o.buildPayload(msgs)
 		if err != nil {
 			httpx.WriteError(w, http.StatusBadRequest, errTypeInvalidRequest, err.Error())
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 
 		apiResp, err := o.service.client.GenerateAssistantResponse(ctx, o.creds.AccessToken, payload, o.creds.Region)
 		if err != nil {
 			logUpstreamError(ctx, short, err, "round", round+1)
 			httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream API error")
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 
-		acc := respconv.NewNonStreamingAccumulator(o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, 0)
+		acc := respconv.NewNonStreamingAccumulator(o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, apiResp.PromptTokens)
 		acc.SetDropToolName(toolsearch.KiroToolSearchName)
 		acc.SetToolNameMap(nameMap.ReverseMap())
 		acc.SetToolInputValidator(respconv.NewToolInputValidator(o.tsCtx.ActiveTools))
@@ -241,6 +293,9 @@ func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.
 		var nsToolSearchInput string
 		err = kiroproto.ParseStream(ctx, apiResp.Body, func(e kiroproto.Event) bool {
 			d := acc.ProcessEvent(e)
+			if d.TextDelta != "" || (d.ToolStop && d.ToolName != toolsearch.KiroToolSearchName) {
+				markMetricsFirstToken(w)
+			}
 			if d.IsError {
 				hasError = true
 				return true
@@ -256,7 +311,10 @@ func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.
 
 		if (err != nil || hasError) && !foundToolSearch {
 			httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream error")
-			return ""
+			if err != nil {
+				return retryOutcome{TerminalErr: err}
+			}
+			return retryOutcome{TerminalErr: errors.New("upstream error")}
 		}
 
 		if calls := acc.InvalidToolCalls(); len(calls) > 0 && !foundToolSearch {
@@ -267,7 +325,7 @@ func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.
 					"invalid_tool_calls", len(calls),
 				)
 				writeInvalidToolUseFallback(ctx, w, o.responseModel, false, calls)
-				return ""
+				return retryOutcome{TerminalErr: errors.New("invalid_tool_use_persistent")}
 			}
 			slog.WarnContext(ctx, "retrying tool search after invalid tool_use",
 				"trace_id", short,
@@ -281,9 +339,20 @@ func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.
 			continue
 		}
 
+		var cacheAttempt *promptCacheAttempt
+		if !foundToolSearch {
+			cacheAttempt = o.service.promptCacheAttempt(o.inv, apiResp.PromptTokens)
+			acc.SetUsageAdjuster(cacheAttempt.usageAdjuster())
+		}
 		resp, stats := acc.BuildResponse(o.responseModel)
 		totalInputTokens += stats.InputTokens
 		totalOutputTokens += stats.OutputTokens
+		totalCacheReadTokens += stats.CacheReadInputTokens
+		totalCacheWriteTokens += stats.CacheWriteInputTokens
+		totalRawInputTokens += stats.RawInputTokens
+		totalRawOutputTokens += stats.RawOutputTokens
+		totalRawCacheReadTokens += stats.RawCacheReadTokens
+		totalRawCacheWriteTokens += stats.RawCacheWriteTokens
 		lastStopReason, _ = resp["stop_reason"].(string)
 		lastStopSequence = resp["stop_sequence"]
 
@@ -295,8 +364,9 @@ func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.
 			// Detect empty visible end_turn (thinking-only response) and signal retry.
 			if acc.IsEmptyVisibleEndTurn() {
 				slog.WarnContext(ctx, "empty visible end_turn detected in tool search", "trace_id", short)
-				return retryReasonEmptyVisibleEndTurn
+				return retryOutcome{Reason: retryReasonEmptyVisibleEndTurn}
 			}
+			cacheAttempt.commitIfApplied()
 			normalExit = true
 			break
 		}
@@ -361,22 +431,33 @@ func (o *toolSearchOrchestrator) handleNonStreaming(ctx context.Context, w http.
 		"model":         o.responseModel,
 		"stop_reason":   lastStopReason,
 		"stop_sequence": lastStopSequence,
-		"usage": map[string]any{
-			"input_tokens":                totalInputTokens,
-			"output_tokens":               totalOutputTokens,
-			"cache_read_input_tokens":     0,
-			"cache_creation_input_tokens": 0,
-		},
+		"usage": reportUsageMap(respconv.Usage{
+			InputTokens:           totalInputTokens,
+			OutputTokens:          totalOutputTokens,
+			CacheReadInputTokens:  totalCacheReadTokens,
+			CacheWriteInputTokens: totalCacheWriteTokens,
+		}),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.MarshalWrite(w, finalResp); err != nil {
 		slog.ErrorContext(ctx, "write non-streaming response failed", "err", err)
+		return retryOutcome{TerminalErr: err}
 	}
 	_, _ = w.Write([]byte("\n"))
+	if len(orderedBlocks) > 0 {
+		markMetricsFirstToken(w)
+	}
 
 	logResponseStats(ctx, short, totalInputTokens, totalOutputTokens, false, 0, o.contextWindowSize)
-	return ""
+	if mw, ok := w.(*metricsResponseWriter); ok {
+		mw.setUsageDetailed(
+			totalInputTokens, totalOutputTokens, totalCacheReadTokens, totalCacheWriteTokens,
+			totalRawInputTokens, totalRawOutputTokens, totalRawCacheReadTokens, totalRawCacheWriteTokens,
+			resolveContextPercent(0, false, totalInputTokens, o.contextWindowSize),
+		)
+	}
+	return retryOutcome{}
 }
 
 // executeSearch runs the tool search, promotes results, and logs.

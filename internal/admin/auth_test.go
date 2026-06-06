@@ -12,7 +12,7 @@ const testAdminKey = "test-key-12345"
 
 func newAuthedTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	s := NewServer("127.0.0.1", 0, testAdminKey, "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
+	s := NewServer("127.0.0.1", 0, testAdminKey, newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
 	return httptest.NewServer(s.Handler())
 }
 

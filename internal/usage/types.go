@@ -3,7 +3,7 @@
 // credential, model, or time bucket.
 //
 // The default backend pairs an in-memory ring (for fast recent queries)
-// with a SQLite append log (for arbitrary-window queries). Both share the
+// with a PostgreSQL append log (for arbitrary-window queries). Both share the
 // same Record schema.
 package usage
 
@@ -14,26 +14,36 @@ import (
 
 // Status values reported alongside each Record.
 const (
-	StatusSuccess       = "success"
-	StatusRateLimited   = "rate_limited"
-	StatusAuthError     = "auth_error"
-	StatusUpstreamError = "upstream_error"
+	StatusSuccess        = "success"
+	StatusInvalidRequest = "invalid_request"
+	StatusRateLimited    = "rate_limited"
+	StatusAuthError      = "auth_error"
+	StatusUpstreamError  = "upstream_error"
 )
 
 // Record is one observation of an upstream call.
 type Record struct {
-	Timestamp        time.Time
-	CredentialID     string // pool.Credential.ID; "" if pool disabled (legacy single-cred mode)
-	Provider         string // "kiro" (v1)
-	RequestedModel   string // client-supplied, e.g. "claude-opus-4-7"
-	ResolvedModel    string // upstream SKU, e.g. "claude-opus-4.7"
-	InputTokens      int
-	OutputTokens     int
-	CacheReadTokens  int
-	CacheWriteTokens int
-	Status           string
-	LatencyMs        int
-	TraceID          string
+	Timestamp           time.Time
+	CredentialID        string // pool.Credential.ID
+	Provider            string // "kiro" (v1)
+	RequestPath         string // proxy path, e.g. /v1/messages or /api/cc/v1/messages
+	PromptCacheProfile  string // matched local prompt-cache report profile, if any
+	PromptCachePrefix   string // matched route prefix, if any
+	RequestedModel      string // client-supplied, e.g. "claude-opus-4-7"
+	ResolvedModel       string // upstream SKU, e.g. "claude-opus-4.7"
+	InputTokens         int
+	OutputTokens        int
+	CacheReadTokens     int
+	CacheWriteTokens    int
+	RawInputTokens      int // upstream/raw before local prompt-cache reporting projection
+	RawOutputTokens     int
+	RawCacheReadTokens  int
+	RawCacheWriteTokens int
+	Status              string
+	LatencyMs           int
+	FirstTokenMs        int // time to first visible token/content; 0 if unavailable
+	TraceID             string
+	ErrorMessage        string
 
 	// [fork] Capture fields for the admin history panel.
 	Type                 string  // "stream" | "non-stream"
@@ -109,15 +119,15 @@ type Aggregate struct {
 
 // CellStats is one row of ByCredModel.
 type CellStats struct {
-	Requests          int64
-	Success           int64
-	Failed            int64
-	InputTokens       int64
-	OutputTokens      int64
-	CacheReadTokens   int64
-	CacheWriteTokens  int64
-	TotalLatencyMs    int64     // sum across all requests; divide by Requests for avg
-	LastSeenAt        time.Time
+	Requests         int64
+	Success          int64
+	Failed           int64
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	TotalLatencyMs   int64 // sum across all requests; divide by Requests for avg
+	LastSeenAt       time.Time
 
 	// DeviceLabel carries a representative User-Agent excerpt for cells
 	// in Aggregate.ByDevice. Empty on cells keyed by model or api_key
@@ -147,7 +157,7 @@ func AvgLatencyMs(c CellStats) float64 {
 }
 
 // Store is the persistence layer used by the default Aggregator. Two
-// implementations are provided: memory (ring buffer) and sqlite (append log).
+// implementations are provided for memory (ring buffer) and PostgreSQL.
 type Store interface {
 	Append(rec Record) error
 	Query(ctx context.Context, filter Filter, window Window) (Aggregate, error)

@@ -338,7 +338,8 @@ function renderConfig(c) {
   ro.innerHTML = [
     ['Host', c.host],
     ['Port', c.port],
-    ['DB Path', c.db_path || '—'],
+    ['PostgreSQL', c.postgres_dsn_set ? 'configured' : 'not configured'],
+    ['Redis', c.redis_addr || '—'],
     ['API Key', c.api_key_set ? '••••••••' : 'not set'],
     ['OTel', c.otel ? 'enabled' : 'disabled'],
     ['Log File', c.log_file_path || '—'],

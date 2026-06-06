@@ -37,6 +37,7 @@ dist/
 # Project local directories
 _tmp/
 _docs/
+.run/
 
 # Debug logs
 debug.log

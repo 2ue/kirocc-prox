@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -49,9 +50,9 @@ func (f *fakeScheduler) All() []*pool.Credential {
 	copy(out, f.creds)
 	return out
 }
-func (f *fakeScheduler) MarkSuccess(string, string, pool.Usage)            {}
-func (f *fakeScheduler) MarkRateLimit(string, string, time.Duration)       {}
-func (f *fakeScheduler) MarkAuthError(string, string)                       {}
+func (f *fakeScheduler) MarkSuccess(string, string, pool.Usage)      {}
+func (f *fakeScheduler) MarkRateLimit(string, string, time.Duration) {}
+func (f *fakeScheduler) MarkAuthError(string, string)                {}
 func (f *fakeScheduler) RefreshQuota(id string, snap *pool.KiroQuotaSnapshot) {
 	if c := f.Lookup(id); c != nil {
 		c.Mu.Lock()
@@ -101,6 +102,63 @@ func (f *fakeScheduler) Remove(id string) error {
 	return pool.ErrCredentialNotFound
 }
 
+type fakeCredentialStore struct {
+	mu    sync.Mutex
+	creds []*pool.Credential
+}
+
+func newFakeCredentialStore(creds ...*pool.Credential) *fakeCredentialStore {
+	return &fakeCredentialStore{creds: append([]*pool.Credential(nil), creds...)}
+}
+
+func (f *fakeCredentialStore) Load(context.Context) ([]*pool.Credential, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*pool.Credential, len(f.creds))
+	copy(out, f.creds)
+	return out, nil
+}
+
+func (f *fakeCredentialStore) SaveAll(_ context.Context, creds []*pool.Credential) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creds = append([]*pool.Credential(nil), creds...)
+	return nil
+}
+
+func (f *fakeCredentialStore) SaveOne(_ context.Context, cred *pool.Credential) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, c := range f.creds {
+		if c.ID == cred.ID {
+			f.creds[i] = cred
+			return nil
+		}
+	}
+	f.creds = append(f.creds, cred)
+	return nil
+}
+
+func (f *fakeCredentialStore) Delete(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, c := range f.creds {
+		if c.ID == id {
+			f.creds = append(f.creds[:i], f.creds[i+1:]...)
+			return nil
+		}
+	}
+	return pool.ErrCredentialNotFound
+}
+
+func (f *fakeCredentialStore) All() []*pool.Credential {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*pool.Credential, len(f.creds))
+	copy(out, f.creds)
+	return out
+}
+
 // fakeAggregator records call counts so handler tests can assert routing.
 // recentRecords is consulted by Recent() to return a canned slice for
 // /admin/usage/recent assertions.
@@ -140,11 +198,37 @@ func (f *fakeCache) FetchForce(context.Context, string, string, string, string) 
 	return f.snap, f.err
 }
 
+type fakeImportRefresher struct {
+	err   error
+	calls int
+}
+
+func (f *fakeImportRefresher) ShouldRefresh(*pool.Credential) bool { return true }
+
+func (f *fakeImportRefresher) Refresh(_ context.Context, c *pool.Credential) error {
+	f.calls++
+	if f.err != nil {
+		return f.err
+	}
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	c.AccessToken = "at-refreshed"
+	c.RefreshToken = "rt-refreshed"
+	c.ExpiresAt = time.Now().Add(time.Hour).Unix()
+	c.ProfileARN = "arn:aws:codewhisperer:us-east-1:000:profile/Refreshed"
+	if c.Region == "" {
+		c.Region = "us-east-1"
+	}
+	c.AuthType = "social"
+	return nil
+}
+
 // --- Helpers ---------------------------------------------------------------
 
 func newTestServer(t *testing.T, sched pool.Scheduler, agg usage.Aggregator, cache *fakeCache) (*httptest.Server, func()) {
 	t.Helper()
-	s := NewServer("127.0.0.1", 0, "", "", sched, agg, cache)
+	s := NewServer("127.0.0.1", 0, "", sched, agg, cache)
+	s.SetCredentialStore(newFakeCredentialStore(sched.All()...))
 	ts := httptest.NewServer(s.Handler())
 	return ts, ts.Close
 }
@@ -176,6 +260,216 @@ func decode[T any](t *testing.T, body io.Reader) T {
 		t.Fatalf("unmarshal %T: %v (raw=%s)", v, err, string(data))
 	}
 	return v
+}
+
+func TestDecodeImport_KiroRSFormatsNormalize(t *testing.T) {
+	t.Parallel()
+	raw := `{
+	  "credentials": [
+	    {
+	      "email": "alice@example.com",
+	      "refresh_token": "rt-alice",
+	      "access-token": "at-alice",
+	      "profile_arn": "arn:aws:codewhisperer:us-east-1:000:profile/Alice",
+	      "auth_method": "social",
+	      "auth_region": "us-east-1",
+	      "apiRegion": "us-west-2",
+	      "client_id": "cid",
+	      "client-secret": "csec",
+	      "maxConcurrentRequests": "3",
+	      "proxy_url": "socks5://127.0.0.1:1080"
+	    }
+	  ],
+	  "mode": "replace"
+	}`
+	req, err := decodeImportBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("decodeImportBytes: %v", err)
+	}
+	if req.Mode != "replace" {
+		t.Fatalf("mode = %q, want replace", req.Mode)
+	}
+	if len(req.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(req.Accounts))
+	}
+	got := req.Accounts[0]
+	if got.ID != "alice@example.com" || got.Label != "alice@example.com" {
+		t.Fatalf("id/label = %q/%q, want alice@example.com", got.ID, got.Label)
+	}
+	if got.KiroAuthTokenRaw.AccessToken != "at-alice" || got.KiroAuthTokenRaw.RefreshToken != "rt-alice" {
+		t.Fatalf("tokens = %+v", got.KiroAuthTokenRaw)
+	}
+	if got.KiroAuthTokenRaw.ProfileARN != "arn:aws:codewhisperer:us-east-1:000:profile/Alice" {
+		t.Fatalf("profileArn = %q", got.KiroAuthTokenRaw.ProfileARN)
+	}
+	if got.KiroAuthTokenRaw.Region != "us-west-2" || got.KiroAuthTokenRaw.SSORegion != "us-east-1" {
+		t.Fatalf("regions = api %q sso %q", got.KiroAuthTokenRaw.Region, got.KiroAuthTokenRaw.SSORegion)
+	}
+	if got.KiroAuthTokenRaw.ClientID != "cid" || got.KiroAuthTokenRaw.ClientSecret != "csec" {
+		t.Fatalf("client = %q/%q", got.KiroAuthTokenRaw.ClientID, got.KiroAuthTokenRaw.ClientSecret)
+	}
+	if got.MaxInFlight != 3 || got.ProxyURL != "socks5://127.0.0.1:1080" {
+		t.Fatalf("max/proxy = %d/%q", got.MaxInFlight, got.ProxyURL)
+	}
+}
+
+func TestDecodeImport_JSONLAndWrappedDataCredentials(t *testing.T) {
+	t.Parallel()
+	raw := `{"refreshToken":"rt-1","profileArn":"arn:aws:codewhisperer:us-east-1:000:profile/One","accessToken":"at-1"}
+{"data":{"credentials":[{"refresh_token":"rt-2","profile_arn":"arn:aws:codewhisperer:us-east-1:000:profile/Two","access_token":"at-2"}]}}`
+	req, err := decodeImportBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("decodeImportBytes: %v", err)
+	}
+	if len(req.Accounts) != 2 {
+		t.Fatalf("accounts = %d, want 2", len(req.Accounts))
+	}
+	if req.Accounts[0].ID != "one" || req.Accounts[1].ID != "two" {
+		t.Fatalf("ids = %q/%q, want one/two", req.Accounts[0].ID, req.Accounts[1].ID)
+	}
+	if req.Accounts[1].KiroAuthTokenRaw.RefreshToken != "rt-2" {
+		t.Fatalf("second refresh token = %q", req.Accounts[1].KiroAuthTokenRaw.RefreshToken)
+	}
+}
+
+func TestDecodeImport_AllowsRefreshTokenOnlyLikeKiroRS(t *testing.T) {
+	t.Parallel()
+	req, err := decodeImportBytes([]byte(`{"refreshToken":"rt-only","priority":7,"region":"eu-west-1"}`))
+	if err != nil {
+		t.Fatalf("decodeImportBytes: %v", err)
+	}
+	if len(req.Accounts) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(req.Accounts))
+	}
+	got := req.Accounts[0]
+	if got.KiroAuthTokenRaw.RefreshToken != "rt-only" {
+		t.Fatalf("refreshToken = %q", got.KiroAuthTokenRaw.RefreshToken)
+	}
+	if got.KiroAuthTokenRaw.AccessToken != "" || got.KiroAuthTokenRaw.ProfileARN != "" {
+		t.Fatalf("decode should not invent token/profile fields: %+v", got.KiroAuthTokenRaw)
+	}
+}
+
+func TestDecodeImport_RejectsKiroAPIKeyForCurrentPool(t *testing.T) {
+	t.Parallel()
+	_, err := decodeImportBytes([]byte(`{"kiroApiKey":"ksk_test","authMethod":"api_key"}`))
+	if err == nil || !strings.Contains(err.Error(), "API Key") {
+		t.Fatalf("err = %v, want API Key rejection", err)
+	}
+}
+
+func TestAccountsImport_RefreshTokenOnlyUsesRefresher(t *testing.T) {
+	t.Parallel()
+	sched := newFakeScheduler()
+	store := newFakeCredentialStore()
+	s := NewServer("127.0.0.1", 0, "", sched, &fakeAggregator{}, &fakeCache{})
+	s.SetCredentialStore(store)
+	refresher := &fakeImportRefresher{}
+	s.SetRefresher(refresher)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/admin/accounts/import", "application/json",
+		strings.NewReader(`{"refreshToken":"rt-only","region":"us-east-1"}`))
+	if err != nil {
+		t.Fatalf("POST import: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(body))
+	}
+	got := decode[importResp](t, resp.Body)
+	if got.Added != 1 || got.Skipped != 0 || len(got.Errors) != 0 {
+		t.Fatalf("import response = %+v, want one added", got)
+	}
+	if refresher.calls != 1 {
+		t.Fatalf("refresher calls = %d, want 1", refresher.calls)
+	}
+	c := sched.Lookup("imported-1")
+	if c == nil {
+		t.Fatal("imported credential missing from scheduler")
+	}
+	if c.AccessToken != "at-refreshed" || c.ProfileARN == "" || c.RefreshToken != "rt-refreshed" {
+		t.Fatalf("credential not refreshed: access=%q refresh=%q profile=%q", c.AccessToken, c.RefreshToken, c.ProfileARN)
+	}
+	saved := store.All()
+	if len(saved) != 1 || saved[0].AccessToken != "at-refreshed" || saved[0].ProfileARN == "" {
+		t.Fatalf("saved credentials not refreshed: %+v", saved)
+	}
+}
+
+func TestAccountsImport_InvalidRefreshTokenRejected(t *testing.T) {
+	t.Parallel()
+	sched := newFakeScheduler()
+	store := newFakeCredentialStore()
+	s := NewServer("127.0.0.1", 0, "", sched, &fakeAggregator{}, &fakeCache{})
+	s.SetCredentialStore(store)
+	refresher := &fakeImportRefresher{err: errors.New("invalid refresh token")}
+	s.SetRefresher(refresher)
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/admin/accounts/import", "application/json",
+		strings.NewReader(`{"refreshToken":"bad-refresh-token","region":"us-east-1"}`))
+	if err != nil {
+		t.Fatalf("POST import: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(body))
+	}
+	got := decode[importResp](t, resp.Body)
+	if got.Added != 0 || len(got.Errors) != 1 {
+		t.Fatalf("import response = %+v, want one error and no add", got)
+	}
+	if !strings.Contains(got.Errors[0], "refreshToken validation failed") {
+		t.Fatalf("error = %q, want refresh validation failure", got.Errors[0])
+	}
+	if refresher.calls != 1 {
+		t.Fatalf("refresher calls = %d, want 1", refresher.calls)
+	}
+	if len(sched.All()) != 0 {
+		t.Fatalf("scheduler mutated on invalid import: %+v", sched.All())
+	}
+	if len(store.All()) != 0 {
+		t.Fatalf("store mutated on invalid import: %+v", store.All())
+	}
+}
+
+func TestAccountsImport_ReplaceDoesNotRemoveExistingWhenValidationFails(t *testing.T) {
+	t.Parallel()
+	existing := mustCred("existing", "existing@example.com")
+	existing.AccessToken = "at-existing"
+	existing.RefreshToken = "rt-existing"
+	existing.ProfileARN = "arn:aws:codewhisperer:us-east-1:000:profile/Existing"
+	sched := newFakeScheduler(existing)
+	store := newFakeCredentialStore(sched.All()...)
+
+	s := NewServer("127.0.0.1", 0, "", sched, &fakeAggregator{}, &fakeCache{})
+	s.SetCredentialStore(store)
+	s.SetRefresher(&fakeImportRefresher{err: errors.New("invalid refresh token")})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/admin/accounts/import?mode=replace", "application/json",
+		strings.NewReader(`{"refreshToken":"bad-refresh-token","region":"us-east-1"}`))
+	if err != nil {
+		t.Fatalf("POST import replace: %v", err)
+	}
+	defer resp.Body.Close()
+	got := decode[importResp](t, resp.Body)
+	if got.Removed != 0 || got.Added != 0 || len(got.Errors) != 1 {
+		t.Fatalf("import response = %+v, want no mutation and one error", got)
+	}
+	if sched.Lookup("existing") == nil {
+		t.Fatal("existing credential was removed by failed replace import")
+	}
+	saved := store.All()
+	if len(saved) != 1 || saved[0].ID != "existing" {
+		t.Fatalf("saved credentials mutated by failed replace import: %+v", saved)
+	}
 }
 
 // --- Tests -----------------------------------------------------------------
@@ -247,6 +541,9 @@ func TestHealthEndpoint(t *testing.T) {
 func TestAccountsList_MasksAndStats(t *testing.T) {
 	t.Parallel()
 	c := mustCredWithQuota("k-1", "alice@example.com", 100, 25, "PRO")
+	c.MaxInFlight = 3
+	c.InFlight = 2
+	c.InFlightByModel = map[string]int64{"claude-sonnet-4-6": 2}
 	sched := newFakeScheduler(c)
 	agg := &fakeAggregator{
 		agg: usage.Aggregate{
@@ -287,6 +584,12 @@ func TestAccountsList_MasksAndStats(t *testing.T) {
 	if r.Stats24h.Requests != 12 || r.Stats24h.InputTokens != 3400 || r.Stats24h.OutputTokens != 1200 {
 		t.Errorf("stats_24h = %+v", r.Stats24h)
 	}
+	if r.MaxInFlight != 3 || r.InFlight != 2 {
+		t.Errorf("capacity = %d/%d, want 2/3", r.InFlight, r.MaxInFlight)
+	}
+	if got := r.InFlightByModel["claude-sonnet-4-6"]; got != 2 {
+		t.Errorf("in_flight_by_model[claude-sonnet-4-6] = %d, want 2", got)
+	}
 
 	// Ensure no token fields leak via raw JSON inspection.
 	resp2, err := http.Get(ts.URL + "/admin/accounts")
@@ -308,6 +611,9 @@ func TestAccountGet_FullDetailNoMask(t *testing.T) {
 	c.ProfileARN = "arn:aws:codewhisperer:us-east-1:000:profile/Demo"
 	c.Region = "us-east-1"
 	c.AuthType = "social"
+	c.MaxInFlight = 4
+	c.InFlight = 1
+	c.InFlightByModel = map[string]int64{"claude-opus-4-1": 1}
 	sched := newFakeScheduler(c)
 	ts, cleanup := newTestServer(t, sched, &fakeAggregator{}, &fakeCache{})
 	defer cleanup()
@@ -330,6 +636,12 @@ func TestAccountGet_FullDetailNoMask(t *testing.T) {
 	}
 	if d.ProfileARN == "" {
 		t.Error("ProfileARN missing in detail")
+	}
+	if d.MaxInFlight != 4 || d.InFlight != 1 {
+		t.Errorf("detail capacity = %d/%d, want 1/4", d.InFlight, d.MaxInFlight)
+	}
+	if got := d.InFlightByModel["claude-opus-4-1"]; got != 1 {
+		t.Errorf("detail in_flight_by_model[claude-opus-4-1] = %d, want 1", got)
 	}
 }
 
@@ -460,6 +772,83 @@ func TestUsageEndpoint_GroupByModel(t *testing.T) {
 	}
 }
 
+func TestUsageRecent_IncludesCredentialAndCacheTokens(t *testing.T) {
+	t.Parallel()
+	now := time.Now().Truncate(time.Second)
+	agg := &fakeAggregator{
+		recentRecords: []usage.Record{
+			{
+				Timestamp:            now,
+				CredentialID:         "cred-a",
+				RequestPath:          "/api/custom-a/v1/messages",
+				PromptCacheProfile:   "custom-a",
+				PromptCachePrefix:    "/api/custom-a",
+				Type:                 "stream",
+				RequestedModel:       "claude-sonnet-4-6",
+				ResolvedModel:        "claude-sonnet-4.6",
+				Status:               usage.StatusSuccess,
+				InputTokens:          100,
+				OutputTokens:         20,
+				CacheReadTokens:      80,
+				CacheWriteTokens:     40,
+				RawInputTokens:       1000,
+				RawOutputTokens:      20,
+				RawCacheReadTokens:   0,
+				RawCacheWriteTokens:  900,
+				LatencyMs:            1234,
+				FirstTokenMs:         321,
+				ErrorMessage:         "",
+				Device:               "claude-code/1.0.0",
+				DeviceID:             "dev-a",
+				APIKeyID:             "key-a",
+				TraceID:              "trace-a",
+				CreditsUsedSnapshot:  1.5,
+				CreditsTotalSnapshot: 10,
+			},
+		},
+	}
+	ts, cleanup := newTestServer(t, newFakeScheduler(mustCred("cred-a", "alice@example.com")), agg, &fakeCache{})
+	defer cleanup()
+
+	resp, err := http.Get(ts.URL + "/admin/usage/recent?limit=5")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	got := decode[[]recentRecordDTO](t, resp.Body)
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+	row := got[0]
+	if row.CredentialID != "cred-a" {
+		t.Errorf("credential_id = %q, want cred-a", row.CredentialID)
+	}
+	if row.CredentialLabel != "alice@example.com" {
+		t.Errorf("credential_label = %q, want raw email", row.CredentialLabel)
+	}
+	if row.CacheReadTokens != 80 {
+		t.Errorf("cache_read_tokens = %d, want 80", row.CacheReadTokens)
+	}
+	if row.CacheWriteTokens != 40 {
+		t.Errorf("cache_write_tokens = %d, want 40", row.CacheWriteTokens)
+	}
+	if row.InputTokens != 100 || row.OutputTokens != 20 {
+		t.Errorf("tokens = %d/%d, want 100/20", row.InputTokens, row.OutputTokens)
+	}
+	if row.RequestPath != "/api/custom-a/v1/messages" || row.PromptCacheProfile != "custom-a" {
+		t.Errorf("path/profile = %q/%q, want profile request", row.RequestPath, row.PromptCacheProfile)
+	}
+	if row.RawInputTokens != 1000 || row.RawOutputTokens != 20 {
+		t.Errorf("raw tokens = %d/%d, want 1000/20", row.RawInputTokens, row.RawOutputTokens)
+	}
+	if row.FirstTokenMs != 321 {
+		t.Errorf("first_token_ms = %d, want 321", row.FirstTokenMs)
+	}
+}
+
 func TestUsageTimeline_DefaultsAndShape(t *testing.T) {
 	t.Parallel()
 	now := time.Now().Truncate(time.Minute)
@@ -552,7 +941,7 @@ func TestHTMLServing_ContentTypeAndBody(t *testing.T) {
 
 func TestStartShutdown_RespectsContext(t *testing.T) {
 	t.Parallel()
-	s := NewServer("127.0.0.1", 0, "", "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
+	s := NewServer("127.0.0.1", 0, "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
 	// We cannot Start with port 0 via Start() (it doesn't listen on the inner
 	// http.Server's Addr if zero), so just exercise Shutdown directly.
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -564,7 +953,7 @@ func TestStartShutdown_RespectsContext(t *testing.T) {
 
 func TestNewServerDefaults(t *testing.T) {
 	t.Parallel()
-	s := NewServer("", 0, "", "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
+	s := NewServer("", 0, "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
 	if !strings.HasPrefix(s.Addr(), "127.0.0.1:") {
 		t.Errorf("default Addr = %q", s.Addr())
 	}

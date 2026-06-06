@@ -63,6 +63,12 @@ type responseAccumulator struct {
 	OutputTokens          int
 	CacheReadInputTokens  int
 	CacheWriteInputTokens int
+	RawInputTokens        int
+	RawOutputTokens       int
+	RawCacheReadTokens    int
+	RawCacheWriteTokens   int
+	FinalUsage            *Usage
+	UsageAdjuster         UsageAdjuster
 	// Context usage from contextUsageEvent.
 	HasContextUsage        bool
 	ContextUsagePercentage float64

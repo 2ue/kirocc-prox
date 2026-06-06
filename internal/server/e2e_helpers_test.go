@@ -44,7 +44,12 @@ func newE2EServer(t *testing.T, client *capturingClient) *httptest.Server {
 
 func postMessages(t *testing.T, url, body string) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, url+"/v1/messages", strings.NewReader(body))
+	return postMessagesPath(t, url, "/v1/messages", body)
+}
+
+func postMessagesPath(t *testing.T, url, path, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

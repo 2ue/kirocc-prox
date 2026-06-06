@@ -61,9 +61,22 @@
   .badge.ok { background: rgba(34,197,94,0.15); color: var(--green); }
   .badge.error { background: rgba(239,68,68,0.15); color: var(--red); }
   .badge.retry { background: rgba(245,158,11,0.15); color: var(--yellow); }
+  th.error-col, .error-cell { width: 280px; min-width: 280px; max-width: 280px; }
+  .error-cell { text-align: left; color: var(--text-muted); }
+  .error-cell.has-error { color: var(--yellow); }
+  .error-preview-btn { display: inline-block; width: 100%; max-width: 100%; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+  .error-preview-btn:hover, .error-preview-btn:focus-visible { color: var(--yellow); text-decoration: underline; }
+  .error-preview-btn:focus-visible { outline: 1px solid var(--yellow); outline-offset: 2px; }
+  dialog.error-dialog { border: 1px solid var(--border); border-radius: var(--radius); padding: 0; background: var(--surface); color: var(--text); width: min(760px, calc(100vw - 32px)); }
+  dialog.error-dialog::backdrop { background: rgba(0,0,0,0.65); }
+  .error-dialog-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .error-dialog-head strong { font-size: 13px; color: var(--text); }
+  .error-dialog-close { border: 1px solid var(--border); background: var(--surface2); color: var(--text); border-radius: 4px; cursor: pointer; padding: 3px 8px; }
+  .error-dialog-body { padding: 16px; }
+  .error-dialog-text { margin: 0; min-height: 200px; max-height: 56vh; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12px; line-height: 1.55; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
 
   .table-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 13px; }
   thead th { text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 1px solid var(--border); white-space: nowrap; }
   tbody tr { border-bottom: 1px solid rgba(46,51,71,0.5); transition: background 0.1s; }
   tbody tr:hover { background: var(--surface2); }
@@ -177,14 +190,16 @@
             <th>输出</th>
             <th>上下文%</th>
             <th>延迟</th>
+            <th>首字耗时</th>
             <th>重试</th>
             <th>流式</th>
             <th>思考</th>
             <th>会话</th>
+            <th class="error-col">错误信息</th>
           </tr>
         </thead>
         <tbody id="logBody">
-          <tr><td colspan="11" class="empty-state">等待请求…</td></tr>
+          <tr><td colspan="13" class="empty-state">等待请求…</td></tr>
         </tbody>
       </table>
     </div>
@@ -213,6 +228,16 @@
 
 </div>
 
+<dialog id="errorDialog" class="error-dialog">
+  <div class="error-dialog-head">
+    <strong>错误详情</strong>
+    <button class="error-dialog-close" type="button" onclick="closeErrorDialog()">关闭</button>
+  </div>
+  <div class="error-dialog-body">
+    <pre class="error-dialog-text" id="errorDialogText">—</pre>
+  </div>
+</dialog>
+
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
 let paused = false;
@@ -220,6 +245,7 @@ let logRows = [];
 const MAX_ROWS = 200;
 let pendingRows = [];
 let configState = {};
+let errorMessages = {};
 
 // ── Stats ──────────────────────────────────────────────────────────────────
 async function fetchStats() {
@@ -259,7 +285,7 @@ async function fetchLogs() {
 function renderLogTable() {
   const tbody = document.getElementById('logBody');
   if (!logRows.length) {
-    tbody.innerHTML = '<tr><td colspan="11" class="empty-state">等待请求…</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="empty-state">等待请求…</td></tr>';
     setText('logCount', '');
     return;
   }
@@ -293,21 +319,28 @@ function rowHTML(r) {
   const t = new Date(r.time);
   const timeStr = t.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
   const ms = r.latency_ms >= 1000 ? (r.latency_ms/1000).toFixed(1)+'s' : r.latency_ms+'ms';
+  const firstToken = r.first_token_ms > 0 ? (r.first_token_ms >= 1000 ? (r.first_token_ms/1000).toFixed(1)+'s' : r.first_token_ms+'ms') : '—';
   const ctx = r.context_pct > 0 ? r.context_pct.toFixed(1)+'%' : '—';
   const ctxClass = r.context_pct >= 90 ? 'color:var(--red)' : r.context_pct >= 70 ? 'color:var(--yellow)' : '';
   const model = r.model.length > 24 ? r.model.slice(0,22)+'…' : r.model;
   const session = r.session_id ? r.session_id.slice(0,8) : '—';
+  const err = compact(r.error_msg, 140);
+  const errID = r.trace_id || r.id || '';
+  const errKey = err ? (errID || `error-${Object.keys(errorMessages).length + 1}`) : '';
+  if (r.error_msg && errKey) errorMessages[errKey] = r.error_msg;
   return `<td class="mono muted">${timeStr}</td>
     <td title="${esc(r.model)}">${esc(model)}</td>
-    <td><span class="badge ${r.status}">${r.status}</span></td>
+    <td><span class="badge ${esc(r.status)}">${esc(r.status)}</span></td>
     <td class="mono">${fmt(r.input_tokens)}</td>
     <td class="mono">${fmt(r.output_tokens)}</td>
     <td class="mono" style="${ctxClass}">${ctx}</td>
     <td class="mono">${ms}</td>
+    <td class="mono">${firstToken}</td>
     <td class="mono">${r.retry_count || '—'}</td>
     <td>${r.stream ? '✓' : ''}</td>
     <td>${r.thinking ? '✓' : ''}</td>
-    <td class="mono muted" title="${esc(r.session_id)}">${esc(session)}</td>`;
+    <td class="mono muted" title="${esc(r.session_id)}">${esc(session)}</td>
+    <td class="mono error-cell ${err ? 'has-error' : ''}">${err ? `<button class="error-preview-btn" type="button" title="${esc(r.error_msg)}" data-error-id="${esc(errKey)}">${esc(err)}</button>` : '—'}</td>`;
 }
 
 function clearLog() { logRows = []; renderLogTable(); }
@@ -338,7 +371,8 @@ function renderConfig(c) {
   ro.innerHTML = [
     ['主机', c.host],
     ['端口', c.port],
-    ['数据库路径', c.db_path || '—'],
+    ['PostgreSQL', c.postgres_dsn_set ? '已配置' : '未配置'],
+    ['Redis', c.redis_addr || '—'],
     ['API Key', c.api_key_set ? '••••••••' : '未设置'],
     ['OTel', c.otel ? '已启用' : '已禁用'],
     ['日志文件', c.log_file_path || '—'],
@@ -429,6 +463,27 @@ function setText(id, v) { const el = document.getElementById(id); if (el) el.tex
 function fmt(n) { return n == null ? '—' : Number(n).toLocaleString(); }
 function fmtK(n) { if (!n) return '0'; return n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n); }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function compact(s, maxLen) {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  return s.length > maxLen ? s.slice(0, maxLen - 3) + '...' : s;
+}
+function openErrorDialog(id) {
+  document.getElementById('errorDialogText').textContent = errorMessages[id] || '—';
+  const d = document.getElementById('errorDialog');
+  if (d.showModal) d.showModal();
+  else d.setAttribute('open', '');
+}
+function closeErrorDialog() {
+  const d = document.getElementById('errorDialog');
+  if (d.close) d.close();
+  else d.removeAttribute('open');
+}
+document.addEventListener('click', e => {
+  const btn = e.target.closest('.error-preview-btn');
+  if (!btn) return;
+  openErrorDialog(btn.dataset.errorId || '');
+});
 
 // ── Init ───────────────────────────────────────────────────────────────────
 fetchStats();

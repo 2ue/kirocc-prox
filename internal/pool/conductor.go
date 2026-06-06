@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -21,11 +22,11 @@ var ErrNoCredential = errors.New("pool: no credential available")
 //     the next request after recovery returns to the bound credential.
 //  2. Caller does the upstream work.
 //  3. Caller reports the outcome via the Scheduler (MarkSuccess / etc.).
-//  4. Release(cred) updates LastUsedAt and (in future) decrements an
+//  4. Release(cred) updates LastUsedAt and decrements the account's
 //     in-flight counter.
 type Conductor interface {
 	Acquire(ctx context.Context, model, sessionID string) (*Credential, error)
-	Release(cred *Credential)
+	Release(cred *Credential, model ...string)
 }
 
 // DefaultConductor implementation is provided in conductor_default.go.
@@ -109,6 +110,28 @@ func (a *Affinity) Sweep() int {
 		}
 	}
 	return removed
+}
+
+// RunJanitor periodically removes expired entries until ctx is cancelled.
+func (a *Affinity) RunJanitor(ctx context.Context, interval time.Duration) {
+	if a == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if removed := a.Sweep(); removed > 0 {
+				slog.DebugContext(ctx, "pool: swept expired session affinity bindings", "removed", removed)
+			}
+		}
+	}
 }
 
 // Size returns the current number of live bindings. For tests / metrics.

@@ -27,8 +27,8 @@ func (s *Service) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	// [fork] count_tokens is stateless and shouldn't burn a real session
 	// slot; we just need a ProfileARN for payload shaping. Acquire-and-
-	// release here is harmless because Release is a no-op besides updating
-	// LastUsedAt, and the count_tokens path never reaches the upstream.
+	// release here is intentionally immediate so any in-flight reservation is
+	// freed before local token counting work starts.
 	profileARN := ""
 	if cred, err := s.conductor.Acquire(r.Context(), "", ""); err == nil {
 		profileARN = cred.ProfileARN

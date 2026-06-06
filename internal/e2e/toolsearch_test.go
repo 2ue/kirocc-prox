@@ -7,11 +7,13 @@ import (
 	"encoding/json/v2"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/niuma/kirocc-pro/internal/auth"
-	"github.com/niuma/kirocc-pro/internal/config"
 	"github.com/niuma/kirocc-pro/internal/kiroclient"
 	"github.com/niuma/kirocc-pro/internal/pool"
 	"github.com/niuma/kirocc-pro/internal/server"
@@ -21,11 +23,45 @@ import (
 
 func newRealServer(t *testing.T) string {
 	t.Helper()
-	authMgr := auth.NewAuthManager(config.DefaultDBPath())
-	sched, cond, err := pool.NewSingleAccount(authMgr)
-	if err != nil {
-		t.Fatalf("pool: %v", err)
+	creds := auth.Credentials{
+		AccessToken:  os.Getenv("KIROCC_E2E_ACCESS_TOKEN"),
+		RefreshToken: os.Getenv("KIROCC_E2E_REFRESH_TOKEN"),
+		Region:       os.Getenv("KIROCC_E2E_REGION"),
+		SSORegion:    os.Getenv("KIROCC_E2E_SSO_REGION"),
+		ClientID:     os.Getenv("KIROCC_E2E_CLIENT_ID"),
+		ClientSecret: os.Getenv("KIROCC_E2E_CLIENT_SECRET"),
+		ProfileARN:   os.Getenv("KIROCC_E2E_PROFILE_ARN"),
+		AuthType:     os.Getenv("KIROCC_E2E_AUTH_TYPE"),
 	}
+	if creds.AccessToken == "" || creds.RefreshToken == "" || creds.ProfileARN == "" {
+		t.Skip("set KIROCC_E2E_ACCESS_TOKEN, KIROCC_E2E_REFRESH_TOKEN and KIROCC_E2E_PROFILE_ARN to run e2e")
+	}
+	if creds.Region == "" {
+		creds.Region = "us-east-1"
+	}
+	if creds.SSORegion == "" {
+		creds.SSORegion = creds.Region
+	}
+	if creds.AuthType == "" {
+		creds.AuthType = "social"
+	}
+	if exp := os.Getenv("KIROCC_E2E_EXPIRES_AT"); exp != "" {
+		n, err := strconv.ParseInt(exp, 10, 64)
+		if err != nil {
+			t.Fatalf("KIROCC_E2E_EXPIRES_AT: %v", err)
+		}
+		creds.ExpiresAt = n
+	}
+	sched := pool.NewDefaultScheduler()
+	sched.Register([]*pool.Credential{{
+		ID:          "e2e-local",
+		Label:       "e2e local",
+		Provider:    "kiro",
+		Priority:    100,
+		MaxInFlight: pool.DefaultMaxInFlight,
+		Credentials: creds,
+	}})
+	cond := pool.NewConductor(sched, pool.NewSelector("round-robin"), pool.NewAffinity(30*time.Second))
 	client := kiroclient.NewHTTPClient(kiroclient.WithTokenCounter(tokencount.CountBytes))
 	srv := server.New(cond, sched, nil, "", client)
 	ts := testutil.NewTCP4TestServer(t, srv.Handler())

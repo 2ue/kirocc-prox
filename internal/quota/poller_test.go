@@ -60,8 +60,8 @@ func (s *stubScheduler) All() []*pool.Credential {
 	return out
 }
 
-func (s *stubScheduler) MarkSuccess(_, _ string, _ pool.Usage)             {}
-func (s *stubScheduler) MarkRateLimit(_, _ string, _ time.Duration)        {}
+func (s *stubScheduler) MarkSuccess(_, _ string, _ pool.Usage)      {}
+func (s *stubScheduler) MarkRateLimit(_, _ string, _ time.Duration) {}
 
 func (s *stubScheduler) MarkAuthError(credID, reason string) {
 	s.mu.Lock()
@@ -100,10 +100,10 @@ func (s *stubScheduler) errorCount() int {
 
 // programmableFetcher returns canned snapshots / errors keyed by access token.
 type programmableFetcher struct {
-	mu     sync.Mutex
-	byTok  map[string]*pool.KiroQuotaSnapshot
-	errs   map[string]error
-	calls  atomic.Int64
+	mu    sync.Mutex
+	byTok map[string]*pool.KiroQuotaSnapshot
+	errs  map[string]error
+	calls atomic.Int64
 }
 
 func newProgrammableFetcher() *programmableFetcher {
@@ -137,6 +137,73 @@ func (f *programmableFetcher) Fetch(_ context.Context, token, _, _ string) (*poo
 		return &c, nil
 	}
 	return &pool.KiroQuotaSnapshot{FetchedAt: time.Now(), PlanName: "default"}, nil
+}
+
+type fakeRefresher struct {
+	mu       sync.Mutex
+	newToken string
+	err      error
+	calls    int
+}
+
+func (r *fakeRefresher) Refresh(_ context.Context, cred *pool.Credential) error {
+	r.mu.Lock()
+	r.calls++
+	newToken := r.newToken
+	err := r.err
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	cred.Mu.Lock()
+	cred.AccessToken = newToken
+	cred.Mu.Unlock()
+	return nil
+}
+
+func (r *fakeRefresher) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+type fakeCredentialFetcher struct {
+	mu        sync.Mutex
+	responses map[string]*pool.KiroQuotaSnapshot
+	errs      map[string]error
+	calls     []string
+}
+
+func newFakeCredentialFetcher() *fakeCredentialFetcher {
+	return &fakeCredentialFetcher{
+		responses: make(map[string]*pool.KiroQuotaSnapshot),
+		errs:      make(map[string]error),
+	}
+}
+
+func (f *fakeCredentialFetcher) FetchQuota(_ context.Context, cred *pool.Credential) (*pool.KiroQuotaSnapshot, error) {
+	cred.Mu.RLock()
+	token := cred.AccessToken
+	cred.Mu.RUnlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, token)
+	if err, ok := f.errs[token]; ok {
+		return nil, err
+	}
+	if snap, ok := f.responses[token]; ok {
+		cp := *snap
+		return &cp, nil
+	}
+	return &pool.KiroQuotaSnapshot{FetchedAt: time.Now(), PlanName: "default"}, nil
+}
+
+func (f *fakeCredentialFetcher) callTokens() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
 }
 
 func makeCred(id, token string, disabled bool) *pool.Credential {
@@ -239,7 +306,7 @@ func TestPoller_ContextCancelStopsRun(t *testing.T) {
 
 func TestPoller_DefaultsApplied(t *testing.T) {
 	sched := newStubScheduler()
-	p := NewPoller(sched, NewCache(newProgrammableFetcher(), time.Second), 0, 0)
+	p := NewPoller(sched, NewCache(newProgrammableFetcher(), time.Second), -1, 0)
 	dp, ok := p.(*DefaultPoller)
 	if !ok {
 		t.Fatal("NewPoller did not return *DefaultPoller")
@@ -249,6 +316,32 @@ func TestPoller_DefaultsApplied(t *testing.T) {
 	}
 	if dp.maxConcurrent != DefaultMaxConcurrent {
 		t.Errorf("maxConcurrent = %d, want %d", dp.maxConcurrent, DefaultMaxConcurrent)
+	}
+}
+
+func TestPoller_ZeroIntervalDisabled(t *testing.T) {
+	cred := makeCred("disabled-poller-cred", "tok", false)
+	sched := newStubScheduler(cred)
+	fetcher := newProgrammableFetcher()
+	cache := NewCache(fetcher, time.Millisecond)
+	p := NewPoller(sched, cache, 0, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if got := fetcher.calls.Load(); got != 0 {
+		t.Fatalf("fetch calls = %d, want 0 when poller disabled", got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("disabled poller did not return after ctx cancel")
 	}
 }
 
@@ -290,5 +383,73 @@ func TestPoller_UsesEmbeddedAuthCredentials(t *testing.T) {
 	}
 	if snap.PlanName != "AuthPlan" {
 		t.Errorf("PlanName = %q, want AuthPlan (fetcher dispatch by token failed)", snap.PlanName)
+	}
+}
+
+func TestPoller_AuthErrorRefreshesTokenAndRetries(t *testing.T) {
+	cred := makeCred("auth-error", "expired-token", false)
+	sched := newStubScheduler(cred)
+	fetcher := newFakeCredentialFetcher()
+	fetcher.errs["expired-token"] = errors.New(`getUsageLimits: status 403: {"message":"The bearer token included in the request is invalid."}`)
+	fetcher.responses["fresh-token"] = &pool.KiroQuotaSnapshot{PlanName: "FreshPlan"}
+	refresher := &fakeRefresher{newToken: "fresh-token"}
+
+	p := NewPoller(sched, NewCache(newProgrammableFetcher(), time.Second), time.Hour, 1,
+		WithCredentialFetcher(fetcher),
+		WithRefresher(refresher),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if sched.refreshCount() == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if refresher.callCount() != 1 {
+		t.Fatalf("refresh calls = %d, want 1", refresher.callCount())
+	}
+	tokens := fetcher.callTokens()
+	if len(tokens) != 2 || tokens[0] != "expired-token" || tokens[1] != "fresh-token" {
+		t.Fatalf("fetch tokens = %v, want [expired-token fresh-token]", tokens)
+	}
+	sched.mu.Lock()
+	snap := sched.refreshCalls["auth-error"]
+	errMsg := sched.recordErrorCalls["auth-error"]
+	sched.mu.Unlock()
+	if snap == nil || snap.PlanName != "FreshPlan" {
+		t.Fatalf("quota snap = %+v, want FreshPlan", snap)
+	}
+	if errMsg != "" {
+		t.Fatalf("recorded error = %q, want none", errMsg)
+	}
+}
+
+func TestPoller_FailedCredentialBackoffSkipsNextTick(t *testing.T) {
+	cred := makeCred("bad", "tok-bad", false)
+	sched := newStubScheduler(cred)
+	fetcher := newProgrammableFetcher()
+	fetcher.setErr("tok-bad", errors.New("upstream 500"))
+	p := NewPoller(sched, NewCache(fetcher, time.Millisecond), 20*time.Millisecond, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+	time.Sleep(80 * time.Millisecond)
+	cancel()
+	<-done
+
+	if got := fetcher.calls.Load(); got != 1 {
+		t.Fatalf("fetch calls = %d, want 1 because backoff skips following ticks", got)
+	}
+	if got := sched.errorCount(); got != 1 {
+		t.Fatalf("record-error calls = %d, want 1", got)
 	}
 }

@@ -22,14 +22,15 @@ type ConfigPatch struct {
 
 // SafeConfig is the config view exposed to the dashboard (no secrets).
 type SafeConfig struct {
-	Port          int    `json:"port"`
-	Host          string `json:"host"`
-	DBPath        string `json:"db_path"`
-	APIKeySet     bool   `json:"api_key_set"`
-	Debug         bool   `json:"debug"`
-	OTel          bool   `json:"otel"`
-	OTelBodyLimit int    `json:"otel_body_limit"`
-	LogFilePath   string `json:"log_file_path"`
+	Port           int    `json:"port"`
+	Host           string `json:"host"`
+	PostgresDSNSet bool   `json:"postgres_dsn_set"`
+	RedisAddr      string `json:"redis_addr"`
+	APIKeySet      bool   `json:"api_key_set"`
+	Debug          bool   `json:"debug"`
+	OTel           bool   `json:"otel"`
+	OTelBodyLimit  int    `json:"otel_body_limit"`
+	LogFilePath    string `json:"log_file_path"`
 }
 
 // Handler serves the dashboard HTTP endpoints.
@@ -119,14 +120,15 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveGetConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfg.Load()
 	writeJSON(w, http.StatusOK, SafeConfig{
-		Port:          cfg.Port,
-		Host:          cfg.Host,
-		DBPath:        cfg.DBPath,
-		APIKeySet:     cfg.APIKey != "",
-		Debug:         cfg.Debug,
-		OTel:          cfg.OTel,
-		OTelBodyLimit: cfg.OTelBodyLimit,
-		LogFilePath:   cfg.LogFile.Path,
+		Port:           cfg.Port,
+		Host:           cfg.Host,
+		PostgresDSNSet: cfg.PostgresDSN != "",
+		RedisAddr:      cfg.RedisAddr,
+		APIKeySet:      cfg.APIKey != "",
+		Debug:          cfg.Debug,
+		OTel:           cfg.OTel,
+		OTelBodyLimit:  cfg.OTelBodyLimit,
+		LogFilePath:    cfg.LogFile.Path,
 	})
 }
 

@@ -226,12 +226,10 @@ func (s *Server) completeOAuthFromParams(ctx context.Context, e *oauthFlowEntry,
 		e.setStatus(oauthError, "scheduler add: "+err.Error(), "")
 		return
 	}
-	if s.credsPath != "" {
-		if err := s.persistCreds(); err != nil {
-			_ = s.sched.Remove(cred.ID)
-			e.setStatus(oauthError, "persist: "+err.Error(), "")
-			return
-		}
+	if err := s.persistCreds(); err != nil {
+		_ = s.sched.Remove(cred.ID)
+		e.setStatus(oauthError, "persist: "+err.Error(), "")
+		return
 	}
 	e.setStatus(oauthSuccess, "", cred.ID)
 }

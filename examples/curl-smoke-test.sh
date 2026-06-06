@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:3460}"
-API_KEY="${API_KEY:-local-kirocc-test-token}"
+API_KEY="${API_KEY:-dev-proxy-test-token}"
 MODEL="${MODEL:-claude-opus-4-7[1m]}"
 
 printf 'health: '

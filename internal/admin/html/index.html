@@ -28,9 +28,6 @@
         <a href="#/accounts"   data-tab="accounts">
           <span class="ic" aria-hidden="true">◍</span><span>账号</span>
         </a>
-        <a href="#/credsfile"  data-tab="credsfile">
-          <span class="ic" aria-hidden="true">⎘</span><span>认证文件</span>
-        </a>
         <a href="#/stats"      data-tab="stats">
           <span class="ic" aria-hidden="true">↗</span><span>使用统计</span>
         </a>
@@ -44,6 +41,7 @@
           <a href="#/settings/system"      data-tab="settings" data-section="system">系统</a>
           <a href="#/settings/network"     data-tab="settings" data-section="network">网络</a>
           <a href="#/settings/streaming"   data-tab="settings" data-section="streaming">流式传输</a>
+          <a href="#/settings/prompt-cache" data-tab="settings" data-section="prompt-cache">缓存上报</a>
           <a href="#/settings/optimizations" data-tab="settings" data-section="optimizations">kirocc 优化</a>
           <a href="#/settings/api"           data-tab="settings" data-section="api">远程 API</a>
         </div>
@@ -68,11 +66,6 @@
       <div id="openModeBanner" class="banner banner-warn" hidden>
         <strong>未启用密钥认证</strong>
         <span>所有 /admin/* 路径当前开放访问。启动时设置 <code>-admin-key</code> 或 <code>KIROCC_ADMIN_KEY</code> 启用登录保护。</span>
-      </div>
-
-      <div id="singleModeBanner" class="banner banner-info" hidden>
-        <strong>单账号模式</strong>
-        <span>当前从 Kiro CLI SQLite 读取唯一凭据。要管理多账号，请用 <code>-creds-json</code> 启动并提供一个 JSON 文件路径。</span>
       </div>
 
   <main>
@@ -236,7 +229,7 @@
         <nav class="tabs tabs-inline" id="addProviderTabs">
           <a href="#" data-add-tab="oauth" class="active">OAuth 授权</a>
           <a href="#" data-add-tab="token">Token / JSON</a>
-          <a href="#" data-add-tab="local">本地导入</a>
+          <a href="#" data-add-tab="local">文件导入</a>
         </nav>
 
         <div class="modal-body">
@@ -284,7 +277,7 @@
 
           <!-- 2. Token / JSON -->
           <section class="add-tab" data-add-tab-pane="token" hidden>
-            <p class="muted small">粘贴您的 Access Token 或导出的 JSON 数据。系统会自动识别格式。</p>
+            <p class="muted small">粘贴 OAuth 凭据、JSON / JSONL 或导出的凭据数据。系统会自动归一化字段名。</p>
             <label class="full">
               <span>Token / JSON 内容</span>
               <textarea id="addTokenPayload" rows="14" placeholder='可选格式：
@@ -294,31 +287,27 @@
   "kiro_auth_token_raw": { "accessToken": "...", "refreshToken": "...", "profileArn": "arn:...", "authMethod": "Social", "region": "us-east-1" }
 }
 2) 顶层数组（多条凭据）
-3) 纯 Access Token（适用于已有 refresh token 与 profile 的简单注入）'></textarea>
+3) kiro.rs 格式：{"credentials":[...]} / {"accounts":[...]} / {"data":{"credentials":[...]}}
+4) JSONL：每行一个凭据对象
+
+字段可使用 camelCase / snake_case / kebab-case，例如 refreshToken、refresh_token、profileArn、profile_arn。'></textarea>
             </label>
             <div class="modal-actions inline">
               <button type="button" class="btn submit" id="btnSubmitTokenPayload">导入</button>
             </div>
           </section>
 
-          <!-- 3. 本地导入 -->
+          <!-- 3. 文件导入 -->
           <section class="add-tab" data-add-tab-pane="local" hidden>
-            <p class="muted small">支持从本机 Kiro 客户端 SQLite 或 JSON 文件导入账号数据。</p>
+            <p class="muted small">支持从 JSON / JSONL 文件导入账号数据，导入后写入 PostgreSQL。</p>
             <div class="local-block">
-              <div class="local-row" id="localKiroRow">
-                <div>
-                  <strong>从本机 Kiro 客户端导入</strong>
-                  <div class="muted small">读取 Kiro CLI 默认数据库（macOS: ~/Library/Application Support/kiro-cli/data.sqlite3；Linux: ~/.local/share/kiro-cli/data.sqlite3）</div>
-                </div>
-                <button type="button" class="btn primary" id="btnLocalKiroImport">从本机 Kiro 导入</button>
-              </div>
               <div class="local-row">
                 <div>
                   <strong>从 JSON 文件导入</strong>
-                  <div class="muted small">支持 cockpit-tools / cli-proxy-api 导出格式（单条或顶层数组）</div>
+                  <div class="muted small">支持 cockpit-tools / cli-proxy-api / kiro.rs 导出格式（单条、数组、JSONL 或包裹对象）</div>
                 </div>
                 <button type="button" class="btn" id="btnLocalFilePick">选择 JSON 文件</button>
-                <input type="file" id="localFilePicker" accept=".json,application/json" hidden>
+                <input type="file" id="localFilePicker" accept=".json,.jsonl,.txt,application/json" hidden>
               </div>
             </div>
           </section>
@@ -339,8 +328,8 @@
         </header>
         <div class="modal-body">
           <p class="muted small modal-hint">
-            支持顶层数组或 <code>{"accounts": [...], "mode": "append|replace"}</code> 包装。
-            可以直接粘贴 cockpit-tools / cli-proxy-api 的导出文件。
+            支持 JSON / JSONL、单对象、顶层数组、<code>{"accounts": [...]}</code>、<code>{"credentials": [...]}</code>、<code>{"data":{"credentials":[...]}}</code>。
+            字段名会自动兼容 camelCase / snake_case / kebab-case。
           </p>
           <label class="full">
             <span>JSON 内容</span>
@@ -362,7 +351,7 @@
           <div class="form-row">
             <label>
               <span>或从文件读取</span>
-              <input type="file" id="importFile" accept=".json,application/json">
+              <input type="file" id="importFile" accept=".json,.jsonl,.txt,application/json">
             </label>
             <label>
               <span>模式</span>
@@ -430,46 +419,22 @@
       </form>
     </dialog>
 
-
-    <!-- ===== 认证文件 ===== -->
-    <section class="page" data-page="credsfile" hidden>
-      <div class="credsfile-summary" id="credsFileActions">
-        <div class="credsfile-summary-meta">
-          <div class="label">CREDENTIALS_FILE</div>
-          <code class="path" id="credsPath">—</code>
-          <div class="credsfile-summary-stats">
-            <div><strong id="credsSize">—</strong>bytes</div>
-            <div><strong id="credsMtime">—</strong>last_modified</div>
-            <div><strong id="credsCount">—</strong>entries</div>
-          </div>
+    <!-- ===== 错误详情 ===== -->
+    <dialog id="errorDetailDialog" class="modal modal-wide">
+      <div class="modal-form">
+        <header class="modal-head">
+          <h2>错误详情</h2>
+          <button type="button" class="modal-close" data-close-dialog="errorDetailDialog" aria-label="关闭">×</button>
+        </header>
+        <div class="modal-body">
+          <pre class="error-detail-text" id="errorDetailText">—</pre>
         </div>
-        <div class="credsfile-summary-actions">
-          <button class="btn ghost" type="button" id="btnCredsReload">↻ reload</button>
-          <button class="btn ghost" type="button" id="btnCredsDownload">↓ download</button>
-          <button class="btn ghost" type="button" id="btnCredsUpload">↑ upload</button>
-          <input type="file" id="credsFileUpload" accept=".json,application/json" hidden>
-        </div>
+        <footer class="modal-actions">
+          <button type="button" class="btn ghost" id="btnCopyErrorDetail">复制</button>
+          <button type="button" class="btn ghost" data-close-dialog="errorDetailDialog">关闭</button>
+        </footer>
       </div>
-
-      <div class="creds-grid" id="credsCards">
-        <div class="cards-empty muted">loading…</div>
-      </div>
-
-      <details class="credsfile-raw">
-        <summary>
-          <span class="settings-num">RAW</span>
-          <span class="settings-title">原始 JSON 编辑</span>
-          <span class="settings-sub">高级模式 · 直接编辑文件内容并保存</span>
-        </summary>
-        <div class="credsfile-raw-body">
-          <textarea id="credsEditor" spellcheck="false" rows="20"></textarea>
-          <div class="credsfile-raw-actions">
-            <span class="muted small">写入前会做 JSON schema 校验。</span>
-            <button class="btn primary" type="button" id="btnCredsSave">保存编辑</button>
-          </div>
-        </div>
-      </details>
-    </section>
+    </dialog>
 
     <!-- ===== 使用统计 ===== -->
     <section class="page" data-page="stats" hidden>
@@ -556,6 +521,7 @@
               <select id="recentStatus">
                 <option value="">全部</option>
                 <option value="success">成功</option>
+                <option value="invalid_request">请求错误</option>
                 <option value="rate_limited">限流</option>
                 <option value="auth_error">认证错误</option>
                 <option value="upstream_error">上游错误</option>
@@ -568,6 +534,10 @@
             <label class="ctrl">
               <span>API key</span>
               <select id="recentKey"><option value="">全部</option></select>
+            </label>
+            <label class="ctrl">
+              <span>账号</span>
+              <select id="recentCred"><option value="">全部</option></select>
             </label>
             <label class="ctrl">
               <span>拉取上限</span>
@@ -596,18 +566,25 @@
             <thead>
               <tr>
                 <th>时间</th>
+                <th>路径</th>
                 <th>模型</th>
+                <th>缓存</th>
                 <th>API key</th>
+                <th>账号</th>
                 <th>设备</th>
                 <th>状态</th>
                 <th class="num">耗时</th>
+                <th class="num">首字耗时</th>
                 <th class="num">输入</th>
                 <th class="num">输出</th>
+                <th class="num">缓存读</th>
+                <th class="num">缓存写</th>
                 <th class="num">合计</th>
+                <th class="recent-error-col">错误信息</th>
               </tr>
             </thead>
             <tbody id="recentBody">
-              <tr class="empty"><td colspan="9" class="muted">加载中…</td></tr>
+              <tr class="empty"><td colspan="16" class="muted">加载中…</td></tr>
             </tbody>
           </table>
         </div>
@@ -629,7 +606,7 @@
     <!-- ===================== 系统设置 ===================== -->
     <section class="page" data-page="settings" hidden>
       <h1 class="page-title">系统设置</h1>
-      <p class="muted">通过 admin UI 修改的运行时配置，立即生效并落盘到 settings.json。启动 flag 仍优先生效。</p>
+      <p class="muted">通过 admin UI 修改的运行时配置，立即生效并持久化到 PostgreSQL。启动 flag 仍优先生效。</p>
 
       <div class="settings-list">
 
@@ -651,8 +628,10 @@
               <dd id="srvTLSEnabled">—</dd>
               <dt>公开地址</dt>
               <dd><code id="srvPublicURL">—</code></dd>
-              <dt>凭据文件</dt>
-              <dd><code id="srvCredsPath">—</code></dd>
+              <dt>账号存储</dt>
+              <dd><code id="srvAccountStore">—</code></dd>
+              <dt>调度状态</dt>
+              <dd><code id="srvRuntimeStore">—</code></dd>
               <dt>账号池模式</dt>
               <dd id="srvPoolMode">—</dd>
               <dt>GeoIP</dt>
@@ -776,11 +755,13 @@
               <input type="text" id="cfgMaxRetryInterval" placeholder="如 30s, 1m">
             </div>
             <div class="form-row">
-              <label>路由策略</label>
+              <label>路由策略 <span class="muted small">当前进程以启动参数 -pool-strategy 为准</span></label>
               <select id="cfgRoutingStrategy">
                 <option value="round-robin">轮询 (Round Robin)</option>
                 <option value="fill-first">填满优先 (Fill First)</option>
                 <option value="least-used">最少使用 (Least Used)</option>
+                <option value="least-inflight">最少运行中 (Least In-flight)</option>
+                <option value="weighted-least-inflight">按容量最少运行中 (Weighted Least In-flight)</option>
               </select>
             </div>
             <div class="form-row">
@@ -828,9 +809,74 @@
           </div>
         </section>
 
-        <section class="settings-card" data-section="optimizations">
+        <section class="settings-card" data-section="prompt-cache">
           <header class="settings-card-head">
             <span class="settings-num">07</span>
+            <div class="settings-card-titles">
+              <span class="settings-title">缓存上报</span>
+              <span class="settings-sub">按路径配置本地 prompt-cache usage 模拟</span>
+            </div>
+          </header>
+          <div class="settings-body">
+            <p class="settings-hint">
+              这里配置的是下游 usage 上报，不会修改发往 Kiro 上游的 payload。自定义路径统一生效在 <code>/api/&lt;路径&gt;/v1/...</code>，标准 <code>/v1</code> 路径不加 <code>/api</code>。若启动时显式设置了 <code>-prompt-cache-reports</code> 或 <code>KIROCC_PROMPT_CACHE_REPORTS</code>，启动配置优先。
+            </p>
+
+            <div class="prompt-cache-toolbar">
+              <button class="preset-chip" type="button" id="btnPCPresetBasic">载入默认 cc/ha/na</button>
+              <button class="preset-chip" type="button" id="btnPCPresetEmpty">清空配置</button>
+              <button class="preset-chip" type="button" id="btnPCCopyCurl">复制 curl 示例</button>
+            </div>
+
+            <div class="prompt-cache-grid">
+              <div class="prompt-cache-pane">
+                <div class="prompt-cache-pane-head">
+                  <h3 class="opt-section-title">界面配置</h3>
+                  <button class="btn tiny" type="button" id="btnPCSyncJSON">同步到 JSON</button>
+                </div>
+
+                <div class="prompt-cache-subhead">
+                  <div>
+                    <strong>路径映射</strong>
+                    <span class="muted small">配置值 <code>cc</code> 会自动归一为 <code>/api/cc</code>，<code>/v1</code> 保持原路径</span>
+                  </div>
+                  <button class="btn tiny" type="button" id="btnPCRouteAdd">+ 路径</button>
+                </div>
+                <div class="prompt-cache-list" id="pcRoutesList"></div>
+
+                <div class="prompt-cache-subhead">
+                  <div>
+                    <strong>Profiles</strong>
+                    <span class="muted small">profile 名称只是配置标签，代码里没有高低缓存档位</span>
+                  </div>
+                  <button class="btn tiny" type="button" id="btnPCProfileAdd">+ Profile</button>
+                </div>
+                <div class="prompt-cache-list" id="pcProfilesList"></div>
+
+                <div class="form-actions">
+                  <button class="btn primary" type="button" id="btnPCSaveForm">保存界面配置</button>
+                  <span class="muted small" id="promptCacheFormStatus">—</span>
+                </div>
+              </div>
+
+              <div class="prompt-cache-pane">
+                <div class="prompt-cache-pane-head">
+                  <h3 class="opt-section-title">原始 JSON</h3>
+                  <button class="btn tiny" type="button" id="btnPCCopyJSON">复制 JSON</button>
+                </div>
+                <textarea id="promptCacheJSON" class="json-editor" spellcheck="false" rows="30"></textarea>
+                <div class="form-actions">
+                  <button class="btn" type="button" id="btnPCApplyJSON">应用到界面</button>
+                  <button class="btn primary" type="button" id="btnPCSaveJSON">保存 JSON</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-card" data-section="optimizations">
+          <header class="settings-card-head">
+            <span class="settings-num">08</span>
             <div class="settings-card-titles">
               <span class="settings-title">kirocc 优化</span>
               <span class="settings-sub">代理层在请求 / 响应路径上的修复与可调参数</span>
@@ -848,7 +894,7 @@
 
             <h3 class="opt-section-title" style="margin-top: 16px">可调参数</h3>
             <p class="settings-hint">
-              下面的值会保存到 settings.json，下次启动时若对应 <code>KIROCC_*</code> 环境变量未显式设置，将作为默认值生效。环境变量始终优先。
+              下面的值会保存到 PostgreSQL，下次启动时若对应 <code>KIROCC_*</code> 环境变量未显式设置，将作为默认值生效。环境变量始终优先。
             </p>
             <div class="form-row">
               <label>强制 thinking budget 下限 <span class="muted small">0 = 不强制（KIROCC_FORCE_THINKING_BUDGET）</span></label>
@@ -889,7 +935,7 @@
 
             <h3 class="opt-section-title" style="margin-top: 16px">当前生效值</h3>
             <p class="settings-hint">
-              环境变量 / settings.json 合并后实际生效的值；若一项与上面的输入不同，说明该项被 <code>KIROCC_*=</code> 环境变量覆盖了。
+              环境变量 / PostgreSQL 设置合并后实际生效的值；若一项与上面的输入不同，说明该项被 <code>KIROCC_*=</code> 环境变量覆盖了。
             </p>
             <div class="opt-knob-list" id="optKnobList">
               <div class="cards-empty muted">加载中…</div>
@@ -899,7 +945,7 @@
 
         <section class="settings-card" data-section="api">
           <header class="settings-card-head">
-            <span class="settings-num">08</span>
+            <span class="settings-num">09</span>
             <div class="settings-card-titles">
               <span class="settings-title">远程 API</span>
               <span class="settings-sub">用 curl / 脚本远程加号、刷新、查询的接口示例</span>
@@ -925,6 +971,7 @@
        "label": "alice@example.com",
        "priority": 100,
        "proxy_url": "http://1.2.3.4:8080",
+       "max_in_flight": 3,
        "kiro_auth_token_raw": {
          "accessToken":  "<paste from cockpit-tools export>",
          "refreshToken": "<paste from cockpit-tools export>",
@@ -942,7 +989,7 @@ curl -X POST \
      -H "Authorization: Bearer $KEY" \
      -H "Content-Type: application/json" \
      -H "X-Requested-With: XMLHttpRequest" \
-     -d "{\"mode\":\"append\",\"accounts\":$(cat credentials.json)}" \
+     -d "{\"mode\":\"append\",\"accounts\":$(cat accounts.json)}" \
      <span class="api-url">http://127.0.0.1:3458</span>/admin/accounts/import</code></pre>
 
             <h3 class="opt-section-title">更新代理 URL</h3>
@@ -976,8 +1023,8 @@ HEAD = {
     "X-Requested-With":  "XMLHttpRequest",
 }
 
-# 批量导入 cockpit-tools 导出的 credentials.json
-with open("credentials.json") as f:
+# 批量导入 cockpit-tools 导出的 accounts.json
+with open("accounts.json") as f:
     accounts = json.load(f)
 
 r = requests.post(f"{BASE}/admin/accounts/import",

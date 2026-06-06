@@ -2,7 +2,6 @@ package usage
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -10,19 +9,15 @@ import (
 func TestAggregator_PublishFlowsToBothStores(t *testing.T) {
 	t.Parallel()
 	mem := NewMemoryStore(100)
-	path := filepath.Join(t.TempDir(), "agg.sqlite")
-	sqlStore, err := NewSQLiteStore(path)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	agg := NewAggregator(mem, sqlStore)
+	persistent := NewMemoryStore(100)
+	agg := NewAggregator(mem, persistent)
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < 25; i++ {
 		agg.Publish(mkRecord(base.Add(time.Duration(i)*time.Second), "c1", "m", StatusSuccess, 1, 1))
 	}
 
-	// Close drains the worker so SQLite has all records.
+	// Close drains the worker so the persistent store has all records.
 	if err := agg.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -30,30 +25,20 @@ func TestAggregator_PublishFlowsToBothStores(t *testing.T) {
 		t.Errorf("memory Len = %d, want 25", got)
 	}
 
-	// Re-open SQLite read-only to verify persistence.
-	sqlStore2, err := NewSQLiteStore(path)
+	result, err := persistent.Query(context.Background(), Filter{}, Window{Start: base, End: base.Add(time.Hour)})
 	if err != nil {
-		t.Fatalf("reopen sqlite: %v", err)
-	}
-	defer func() { _ = sqlStore2.Close() }()
-	result, err := sqlStore2.Query(context.Background(), Filter{}, Window{Start: base, End: base.Add(time.Hour)})
-	if err != nil {
-		t.Fatalf("query sqlite: %v", err)
+		t.Fatalf("query persistent store: %v", err)
 	}
 	if result.TotalRequests != 25 {
-		t.Errorf("sqlite TotalRequests = %d, want 25", result.TotalRequests)
+		t.Errorf("persistent TotalRequests = %d, want 25", result.TotalRequests)
 	}
 }
 
 func TestAggregator_QueryPrefersMemoryInRecentWindow(t *testing.T) {
 	t.Parallel()
 	mem := NewMemoryStore(100)
-	path := filepath.Join(t.TempDir(), "agg.sqlite")
-	sqlStore, err := NewSQLiteStore(path)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	agg := NewAggregator(mem, sqlStore)
+	persistent := NewMemoryStore(100)
+	agg := NewAggregator(mem, persistent)
 	defer func() { _ = agg.Close() }()
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -72,16 +57,12 @@ func TestAggregator_QueryPrefersMemoryInRecentWindow(t *testing.T) {
 	}
 }
 
-func TestAggregator_QueryFallsBackToSQLite(t *testing.T) {
+func TestAggregator_QueryFallsBackToPersistentStore(t *testing.T) {
 	t.Parallel()
 	// Small memory capacity forces the oldest records out of memory.
 	mem := NewMemoryStore(3)
-	path := filepath.Join(t.TempDir(), "agg.sqlite")
-	sqlStore, err := NewSQLiteStore(path)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	agg := NewAggregator(mem, sqlStore)
+	persistent := NewMemoryStore(100)
+	agg := NewAggregator(mem, persistent)
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	// 10 records spread across 10 minutes. Memory keeps only the last 3
@@ -90,14 +71,14 @@ func TestAggregator_QueryFallsBackToSQLite(t *testing.T) {
 		agg.Publish(mkRecord(base.Add(time.Duration(i)*time.Minute), "c", "m", StatusSuccess, 1, 1))
 	}
 
-	// Wait for the worker to drain pending sqlite writes.
+	// Wait for the worker to drain pending persistent writes.
 	dagg := agg.(*DefaultAggregator)
 	if !dagg.waitForDrain(2 * time.Second) {
-		t.Fatalf("sqlite worker did not drain")
+		t.Fatalf("persistent worker did not drain")
 	}
 
 	// Memory's oldest record is at base+7m; ask for a window starting at
-	// base. Aggregator should fall back to SQLite which has all 10.
+	// base. Aggregator should fall back to the persistent store which has all 10.
 	res, err := agg.Query(context.Background(), Filter{}, Window{Start: base, End: base.Add(time.Hour)})
 	if err != nil {
 		t.Fatalf("query: %v", err)
@@ -114,12 +95,8 @@ func TestAggregator_QueryFallsBackToSQLite(t *testing.T) {
 func TestAggregator_CloseDrainsPendingWrites(t *testing.T) {
 	t.Parallel()
 	mem := NewMemoryStore(1000)
-	path := filepath.Join(t.TempDir(), "drain.sqlite")
-	sqlStore, err := NewSQLiteStore(path)
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	agg := NewAggregator(mem, sqlStore)
+	persistent := NewMemoryStore(1000)
+	agg := NewAggregator(mem, persistent)
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < 500; i++ {
@@ -130,13 +107,7 @@ func TestAggregator_CloseDrainsPendingWrites(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	// Re-open and verify every record made it to disk.
-	sqlStore2, err := NewSQLiteStore(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer func() { _ = sqlStore2.Close() }()
-	res, err := sqlStore2.Query(context.Background(), Filter{}, Window{Start: base, End: base.Add(time.Hour)})
+	res, err := persistent.Query(context.Background(), Filter{}, Window{Start: base, End: base.Add(time.Hour)})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -164,14 +135,10 @@ func TestAggregator_MemoryOnly(t *testing.T) {
 	}
 }
 
-func TestAggregator_SQLiteOnly(t *testing.T) {
+func TestAggregator_PersistentOnly(t *testing.T) {
 	t.Parallel()
-	path := filepath.Join(t.TempDir(), "sqlite-only.sqlite")
-	sqlStore, err := NewSQLiteStore(path)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	agg := NewAggregator(nil, sqlStore)
+	persistent := NewMemoryStore(100)
+	agg := NewAggregator(nil, persistent)
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < 5; i++ {

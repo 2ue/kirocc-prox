@@ -16,10 +16,10 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/google/uuid"
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
 	"github.com/niuma/kirocc-pro/internal/logging"
 	"github.com/niuma/kirocc-pro/internal/tracing"
-	"github.com/google/uuid"
 )
 
 const (
@@ -254,6 +254,7 @@ func (c *HTTPClient) GenerateAssistantResponse(ctx context.Context, token string
 					ContentType: ct,
 					Exception:   exType,
 					Body:        errBody,
+					RetryAfter:  parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 				}
 				c.recordError(ctx, ue)
 				return nil, ue
@@ -280,7 +281,11 @@ func (c *HTTPClient) GenerateAssistantResponse(ctx context.Context, token string
 					continue
 				}
 			}
-			ue := &UpstreamError{Status: resp.StatusCode, ContentType: resp.Header.Get("Content-Type")}
+			ue := &UpstreamError{
+				Status:      resp.StatusCode,
+				ContentType: resp.Header.Get("Content-Type"),
+				RetryAfter:  parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+			}
 			c.recordError(ctx, ue)
 			return nil, ue
 
@@ -302,6 +307,7 @@ func (c *HTTPClient) GenerateAssistantResponse(ctx context.Context, token string
 				ContentType: resp.Header.Get("Content-Type"),
 				Exception:   resolveAWSException(errBody, resp.Header),
 				Body:        errBody,
+				RetryAfter:  parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 			}
 			c.recordError(ctx, ue)
 			return nil, ue
@@ -313,6 +319,7 @@ func (c *HTTPClient) GenerateAssistantResponse(ctx context.Context, token string
 				ContentType: resp.Header.Get("Content-Type"),
 				Exception:   resolveAWSException(errBody, resp.Header),
 				Body:        errBody,
+				RetryAfter:  parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 			}
 			c.recordError(ctx, ue)
 			return nil, ue

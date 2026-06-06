@@ -1,10 +1,10 @@
 package pool
 
-// CredentialFile is the on-disk JSON shape used by the multi-account creds
-// file. The schema mirrors cockpit-tools / cli-proxy-api exports so an
-// existing export file can be consumed unchanged.
+// CredentialFile is the JSON import shape accepted by the admin account
+// importer. The schema mirrors cockpit-tools / cli-proxy-api exports so an
+// existing export payload can be imported into the PostgreSQL account store.
 //
-// Example file (top-level array):
+// Example payload (top-level array):
 //
 //	[
 //	  {
@@ -23,16 +23,14 @@ package pool
 //	    }
 //	  }
 //	]
-//
-// LoadFromJSON(path) and SaveToJSON(path, creds) are implemented in
-// store_json_io.go.
 type CredentialFile struct {
-	ID               string           `json:"id"`
-	Label            string           `json:"label,omitempty"`
-	Provider         string           `json:"provider,omitempty"` // "kiro"; v1 ignores
-	Priority         int              `json:"priority,omitempty"`
-	Disabled         bool             `json:"disabled,omitempty"`
-	DisableCooling   bool             `json:"disable_cooling,omitempty"`
+	ID             string `json:"id"`
+	Label          string `json:"label,omitempty"`
+	Provider       string `json:"provider,omitempty"` // "kiro"; v1 ignores
+	Priority       int    `json:"priority,omitempty"`
+	Disabled       bool   `json:"disabled,omitempty"`
+	DisableCooling bool   `json:"disable_cooling,omitempty"`
+	MaxInFlight    int    `json:"max_in_flight,omitempty"`
 	// ProxyURL pins this account's outbound auth-plane traffic (token
 	// refresh + getUsageLimits + OAuth) through the named proxy. Empty
 	// = default transport (HTTPS_PROXY env or direct). Multiple accounts

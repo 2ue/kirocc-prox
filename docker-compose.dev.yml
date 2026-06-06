@@ -1,0 +1,35 @@
+services:
+  kirocc-pro-postgres:
+    image: postgres:16-alpine
+    container_name: kirocc-pro-postgres-dev
+    environment:
+      POSTGRES_DB: kirocc_pro
+      POSTGRES_USER: kirocc
+      POSTGRES_PASSWORD: kirocc_dev_password
+    ports:
+      - "15432:5432"
+    volumes:
+      - kirocc_pro_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kirocc -d kirocc_pro"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  kirocc-pro-redis:
+    image: redis:7-alpine
+    container_name: kirocc-pro-redis-dev
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "16379:6379"
+    volumes:
+      - kirocc_pro_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  kirocc_pro_pg_data:
+  kirocc_pro_redis_data:

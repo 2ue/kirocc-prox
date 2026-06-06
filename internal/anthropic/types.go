@@ -186,6 +186,7 @@ type ImageSource struct {
 // CacheControl represents cache control settings for prompt caching.
 type CacheControl struct {
 	Type string `json:"type"`
+	TTL  any    `json:"ttl,omitempty"`
 }
 
 // Tool Search Tool type constants.

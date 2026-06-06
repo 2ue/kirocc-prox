@@ -3,16 +3,22 @@ package respconv
 import (
 	"encoding/json/v2"
 
+	"github.com/google/uuid"
 	"github.com/niuma/kirocc-pro/internal/anthropic"
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
-	"github.com/google/uuid"
 )
 
 // NonStreamingStats holds token usage and context info from a non-streaming response.
 type NonStreamingStats struct {
 	// Token usage.
-	InputTokens  int
-	OutputTokens int
+	InputTokens           int
+	OutputTokens          int
+	CacheReadInputTokens  int
+	CacheWriteInputTokens int
+	RawInputTokens        int
+	RawOutputTokens       int
+	RawCacheReadTokens    int
+	RawCacheWriteTokens   int
 	// Context usage from Kiro.
 	HasContextUsage        bool
 	ContextUsagePercentage float64
@@ -48,6 +54,11 @@ func (n *NonStreamingAccumulator) SetToolNameMap(m map[string]string) {
 // SetToolInputValidator validates tool input before recording tool_use blocks.
 func (n *NonStreamingAccumulator) SetToolInputValidator(v *ToolInputValidator) {
 	n.acc.toolInputValidator = v
+}
+
+// SetUsageAdjuster wires an optional usage hook evaluated once at finalization.
+func (n *NonStreamingAccumulator) SetUsageAdjuster(fn UsageAdjuster) {
+	n.acc.UsageAdjuster = fn
 }
 
 // BuildResponse builds the final Anthropic response from accumulated events.
@@ -129,8 +140,19 @@ func buildResponseFromAcc(acc *responseAccumulator, model string) (map[string]an
 	stats := NonStreamingStats{
 		InputTokens:            res.InputTokens,
 		OutputTokens:           res.OutputTokens,
+		RawInputTokens:         res.RawInputTokens,
+		RawOutputTokens:        res.RawOutputTokens,
+		RawCacheReadTokens:     res.RawCacheReadTokens,
+		RawCacheWriteTokens:    res.RawCacheWriteTokens,
 		HasContextUsage:        acc.HasContextUsage,
 		ContextUsagePercentage: acc.ContextUsagePercentage,
+	}
+	if acc.FinalUsage != nil {
+		stats.CacheReadInputTokens = acc.FinalUsage.CacheReadInputTokens
+		stats.CacheWriteInputTokens = acc.FinalUsage.CacheWriteInputTokens
+	} else {
+		stats.CacheReadInputTokens = acc.CacheReadInputTokens
+		stats.CacheWriteInputTokens = acc.CacheWriteInputTokens
 	}
 
 	return map[string]any{

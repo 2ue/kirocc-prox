@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,14 +12,12 @@ import (
 	neturl "net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/niuma/kirocc-pro/internal/admin"
-	"github.com/niuma/kirocc-pro/internal/auth"
 	"github.com/niuma/kirocc-pro/internal/config"
 	"github.com/niuma/kirocc-pro/internal/dashboard"
 	"github.com/niuma/kirocc-pro/internal/georegion"
@@ -26,15 +25,18 @@ import (
 	"github.com/niuma/kirocc-pro/internal/logging"
 	"github.com/niuma/kirocc-pro/internal/oauth"
 	"github.com/niuma/kirocc-pro/internal/pool"
+	"github.com/niuma/kirocc-pro/internal/promptcache"
 	"github.com/niuma/kirocc-pro/internal/provider"
 	codexprovider "github.com/niuma/kirocc-pro/internal/provider/codex"
 	kiroprovider "github.com/niuma/kirocc-pro/internal/provider/kiro"
 	"github.com/niuma/kirocc-pro/internal/quota"
 	"github.com/niuma/kirocc-pro/internal/server"
 	"github.com/niuma/kirocc-pro/internal/settings"
+	"github.com/niuma/kirocc-pro/internal/storage"
 	"github.com/niuma/kirocc-pro/internal/tokencount"
 	"github.com/niuma/kirocc-pro/internal/tracing"
 	"github.com/niuma/kirocc-pro/internal/usage"
+	"github.com/redis/go-redis/v9"
 )
 
 var gitSHA = "dev"
@@ -47,11 +49,6 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
-	// [fork] Subcommands run before flag parsing so `kirocc creds list` can
-	// operate without starting the proxy.
-	if len(args) > 0 && args[0] == "creds" {
-		return runCredsCmd(args[1:])
-	}
 	cfg, err := parseFlags(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -61,6 +58,14 @@ func run(ctx context.Context, args []string) error {
 	}
 	if err := config.ApplyEnvOverrides(&cfg); err != nil {
 		return fmt.Errorf("config: %w", err)
+	}
+	promptCacheReportsExplicit := cfg.PromptCacheReportsJSON != ""
+	if promptCacheReportsExplicit {
+		reports, err := config.ParsePromptCacheReports(cfg.PromptCacheReportsJSON)
+		if err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+		cfg.PromptCacheReports = reports
 	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("config: %w", err)
@@ -83,8 +88,6 @@ func run(ctx context.Context, args []string) error {
 		slog.Info("OpenTelemetry tracing enabled", "body_limit", cfg.OTelBodyLimit)
 	}
 
-	authMgr := auth.NewAuthManager(cfg.DBPath)
-
 	// [fork] Provider registry: every upstream model service registers
 	// here (Kiro today, Codex/Gemini/... in later milestones).
 	registry := provider.NewRegistry()
@@ -95,41 +98,46 @@ func run(ctx context.Context, args []string) error {
 	}
 	registry.Register(codexprovider.New(codexClient))
 
-	// [fork] Pool: multi-account JSON if cfg.CredsJSON is set, else the
-	// single-account SQLite adapter (which preserves the upstream
-	// auto-refresh behavior).
-	scheduler, conductor, refresher, err := buildPool(cfg, authMgr, registry)
+	pgDB, err := storage.OpenPostgres(ctx, cfg.PostgresDSN)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = pgDB.Close() }()
+	accountStore := storage.NewPostgresAccountStore(pgDB)
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+		DB:       cfg.RedisDB,
+	})
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		_ = redisClient.Close()
+		return fmt.Errorf("ping redis: %w", err)
+	}
+	defer func() { _ = redisClient.Close() }()
+	runtimeStore := pool.NewRedisRuntimeStore(redisClient, cfg.RedisKeyPrefix)
+
+	scheduler, conductor, refresher, err := buildPool(ctx, cfg, accountStore, runtimeStore, registry)
 	if err != nil {
 		return fmt.Errorf("pool: %w", err)
 	}
 
-	// [fork] Usage aggregator (in-memory ring + optional SQLite append log).
-	aggregator, err := buildAggregator(cfg)
+	aggregator, err := buildAggregator(cfg, pgDB)
 	if err != nil {
 		return fmt.Errorf("usage: %w", err)
 	}
 	defer func() { _ = aggregator.Close() }()
 
-	// [fork] Settings store (admin-mutable runtime config). When the
-	// path is set we keep a single instance shared across the proxy
-	// (for multi-API-key auth) and the admin server (for editing).
-	var settingsStore *settings.Store
-	if path := resolveSettingsPath(cfg); path != "" {
-		store, err := settings.New(path)
-		if err != nil {
-			return fmt.Errorf("settings: %w", err)
-		}
-		settingsStore = store
-		// [fork] Push persisted KIROCC_* knobs into the process env so the
-		// hot path (reqconv / thinking.go) sees them without a refactor.
-		// Explicit env at launch always wins.
-		if set := store.Get().Optimizations.ApplyToEnv(); len(set) > 0 {
-			slog.Info("optimizations applied from settings", "vars", set)
-		}
-		slog.Info("settings store ready", "path", path)
+	settingsStore, err := settings.NewPostgres(pgDB)
+	if err != nil {
+		return fmt.Errorf("settings: %w", err)
 	}
+	if set := settingsStore.Get().Optimizations.ApplyToEnv(); len(set) > 0 {
+		slog.Info("optimizations applied from settings", "vars", set)
+	}
+	slog.Info("settings store ready", "path", settingsStore.Path())
 
-	kiroClient := buildKiroClient(authMgr, cfg)
+	kiroClient := buildKiroClient(cfg)
 
 	// [fork] GeoIP resolver: optional, off by default. When -geoip-mmdb
 	// is provided we load the MaxMind file once and reuse a single
@@ -148,23 +156,38 @@ func run(ctx context.Context, args []string) error {
 
 	collector := dashboard.NewCollector(500)
 	dashHandler := dashboard.NewHandler(collector, cfg)
-	srv := buildServer(conductor, scheduler, aggregator, kiroClient, cfg, collector, dashHandler, registry, settingsStore, geoResolver)
+	srv := buildServer(conductor, scheduler, aggregator, kiroClient, cfg, collector, dashHandler, registry, settingsStore, geoResolver, promptCacheReportsExplicit)
+
+	janitorCtx, janitorCancel := context.WithCancel(ctx)
+	defer janitorCancel()
+	if c, ok := conductor.(*pool.DefaultConductor); ok {
+		go c.RunAffinityJanitor(janitorCtx, time.Minute)
+	}
+	go srv.RunPromptCacheJanitor(janitorCtx, time.Minute)
 
 	// [fork] Quota poller (Kiro getUsageLimits → scheduler snapshots).
 	quotaCache := quota.NewCache(quota.NewKiroFetcher(nil), quota.DefaultCacheTTL)
-	pollerCtx, pollerCancel := context.WithCancel(ctx)
-	defer pollerCancel()
-	go quota.NewPoller(scheduler, quotaCache, cfg.QuotaPollInterval, quota.DefaultMaxConcurrent).Run(pollerCtx)
+	if cfg.QuotaPollInterval > 0 {
+		pollerCtx, pollerCancel := context.WithCancel(ctx)
+		defer pollerCancel()
+		go quota.NewPoller(scheduler, quotaCache, cfg.QuotaPollInterval, quota.DefaultMaxConcurrent,
+			quota.WithCredentialFetcher(registry),
+			quota.WithRefresher(refresher),
+		).Run(pollerCtx)
+	} else {
+		slog.Info("quota poller disabled", "interval", cfg.QuotaPollInterval)
+	}
 
 	// [fork] Admin server (separate listener on AdminHost:AdminPort).
 	var adminCancel context.CancelFunc = func() {}
 	if cfg.AdminEnabled {
-		adminSrv := admin.NewServer(cfg.AdminHost, cfg.AdminPort, cfg.AdminKey, cfg.CredsJSON, scheduler, aggregator, quotaCache)
+		adminSrv := admin.NewServer(cfg.AdminHost, cfg.AdminPort, cfg.AdminKey, scheduler, aggregator, quotaCache)
 		adminSrv.SetRegistry(registry)
 		adminSrv.SetOAuthCache(oauth.NewStateCache(0))
 		adminSrv.SetPublicBaseURL(cfg.AdminPublicURL)
 		adminSrv.SetTLS(cfg.AdminTLSCert, cfg.AdminTLSKey)
 		adminSrv.SetSettings(settingsStore)
+		adminSrv.SetCredentialStore(accountStore)
 		adminSrv.SetRefresher(refresher)
 		adminSrv.SetGeoResolver(geoResolver)
 		// proxy base url defaults to the configured proxy host/port (loopback ok)
@@ -217,7 +240,6 @@ func parseFlags(args []string) (config.Config, error) {
 	var cfg config.Config
 	fs.IntVar(&cfg.Port, "port", 9326, "listen port")
 	fs.StringVar(&cfg.Host, "host", "127.0.0.1", "bind host")
-	fs.StringVar(&cfg.DBPath, "db", config.DefaultDBPath(), "kiro-cli SQLite DB path")
 	fs.StringVar(&cfg.APIKey, "api-key", "", "optional API key for authentication")
 	fs.BoolVar(&cfg.Debug, "debug", false, "enable debug logging with OTel JSON Lines output")
 	fs.BoolVar(&cfg.OTel, "otel", false, "enable OpenTelemetry tracing (OTLP HTTP exporter)")
@@ -229,8 +251,7 @@ func parseFlags(args []string) (config.Config, error) {
 	fs.BoolVar(&cfg.LogFile.Compress, "log-compress", false, "compress rotated log files with gzip")
 	fs.BoolVar(&cfg.LogFile.Console, "log-console", false, "also write logs to console when -log-file is set")
 	// [fork] Pool / admin / usage / quota flags (Milestone 2-A + 2-B).
-	fs.StringVar(&cfg.CredsJSON, "creds-json", "", "path to multi-account credentials JSON; empty = single-account SQLite mode (default ~/.config/kirocc/credentials.json)")
-	fs.StringVar(&cfg.PoolStrategy, "pool-strategy", config.DefaultPoolStrategy, "credential selection strategy: round-robin|fill-first|least-used")
+	fs.StringVar(&cfg.PoolStrategy, "pool-strategy", config.DefaultPoolStrategy, "credential selection strategy: round-robin|fill-first|least-used|least-inflight|weighted-least-inflight")
 	fs.DurationVar(&cfg.SessionAffinityTTL, "affinity-ttl", config.DefaultSessionAffinityTTL, "how long a session sticks to a credential after inactivity")
 	fs.BoolVar(&cfg.AdminEnabled, "admin", true, "enable the admin HTTP server (multi-account / quota dashboard)")
 	fs.StringVar(&cfg.AdminHost, "admin-host", config.DefaultAdminHost, "admin server bind host")
@@ -239,50 +260,31 @@ func parseFlags(args []string) (config.Config, error) {
 	fs.StringVar(&cfg.AdminPublicURL, "admin-public-url", "", "externally-visible URL of the admin server (used for OAuth redirect_uri); e.g. https://admin.example.com")
 	fs.StringVar(&cfg.AdminTLSCert, "admin-tls-cert", "", "PEM-encoded TLS certificate path; enables HTTPS when paired with -admin-tls-key")
 	fs.StringVar(&cfg.AdminTLSKey, "admin-tls-key", "", "PEM-encoded TLS key path")
-	fs.StringVar(&cfg.UsageDB, "usage-db", "", "SQLite path for usage persistence; empty = memory-only (default ~/.config/kirocc/usage.sqlite)")
 	fs.IntVar(&cfg.UsageMemCap, "usage-mem-cap", config.DefaultUsageMemCap, "in-memory usage ring buffer capacity")
 	fs.DurationVar(&cfg.QuotaPollInterval, "quota-poll-interval", config.DefaultQuotaPollInterval, "interval between automatic Kiro quota refreshes")
+	fs.BoolVar(&cfg.PromptCacheEnabled, "prompt-cache", false, "enable local prompt-cache usage simulation when cache_control is present")
+	fs.Float64Var(&cfg.PromptCacheTargetReadRatio, "prompt-cache-target-read-ratio", config.DefaultPromptCacheReadRatio, "target cache read ratio for local prompt-cache usage simulation (0..0.99)")
+	fs.StringVar(&cfg.PromptCacheReportsJSON, "prompt-cache-reports", "", "JSON path/profile usage reporting config; overrides settings prompt_cache_reports")
 	fs.StringVar(&cfg.CodexProxy, "codex-proxy", "", "outbound HTTP/SOCKS proxy for the Codex (OpenAI) provider, e.g. http://127.0.0.1:7890 — bypasses regional blocks without routing other providers through it")
-	fs.StringVar(&cfg.SettingsPath, "settings", "", "path to runtime settings JSON (defaults to ~/.config/kirocc/settings.json when admin is enabled); persists multi API key list and admin-mutable config")
 	fs.StringVar(&cfg.GeoIPMMDB, "geoip-mmdb", "", "path to a MaxMind GeoLite2-Country MMDB file; enables client-IP→region routing for the credential pool. Empty = GeoIP off (falls back to settings.network.preferred_region)")
+	fs.StringVar(&cfg.PostgresDSN, "postgres-dsn", config.DefaultPostgresDSN, "PostgreSQL DSN for durable accounts/settings/usage state")
+	fs.StringVar(&cfg.RedisAddr, "redis-addr", config.DefaultRedisAddr, "Redis address for runtime scheduling state")
+	fs.StringVar(&cfg.RedisPassword, "redis-password", "", "Redis password")
+	fs.IntVar(&cfg.RedisDB, "redis-db", 0, "Redis database number")
+	fs.StringVar(&cfg.RedisKeyPrefix, "redis-key-prefix", config.DefaultRedisKeyPrefix, "Redis key prefix for this kirocc deployment")
+	fs.DurationVar(&cfg.RedisLeaseTTL, "redis-lease-ttl", config.DefaultRedisLeaseTTL, "TTL for in-flight Redis reservations")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
-	// Apply defaults that need runtime resolution (home directory).
-	if cfg.CredsJSON == "" {
-		// Try the default path only if the file exists; otherwise leave empty
-		// to keep single-account SQLite mode as the absolute default.
-		if def := config.DefaultCredsJSONPath(); def != "" {
-			if _, err := os.Stat(def); err == nil {
-				cfg.CredsJSON = def
-			}
-		}
-	}
-	if cfg.UsageDB == "" {
-		if def := config.DefaultUsageDBPath(); def != "" {
-			cfg.UsageDB = def
-		}
+	if fs.NArg() > 0 {
+		return cfg, fmt.Errorf("unexpected positional argument %q", fs.Arg(0))
 	}
 	return cfg, nil
 }
 
-func buildKiroClient(authMgr *auth.AuthManager, cfg config.Config) kiroclient.Client {
+func buildKiroClient(cfg config.Config) kiroclient.Client {
 	clientOpts := []kiroclient.HTTPClientOption{
 		kiroclient.WithTokenCounter(tokencount.CountBytes),
-	}
-	// [fork] In single-account mode, hook the kiroclient's on-403 refresher to
-	// the AuthManager so a stale token gets a one-shot retry. In
-	// multi-account mode the same 403 surfaces to the handler, which marks
-	// the credential and lets the next request pick a different one.
-	if cfg.CredsJSON == "" {
-		clientOpts = append(clientOpts, kiroclient.WithTokenRefresher(func(ctx context.Context) (string, error) {
-			authMgr.InvalidateCache()
-			creds, err := authMgr.GetToken(ctx)
-			if err != nil {
-				return "", err
-			}
-			return creds.AccessToken, nil
-		}))
 	}
 	if cfg.OTel {
 		clientOpts = append(clientOpts, kiroclient.WithOTel(cfg.OTelBodyLimit))
@@ -290,13 +292,27 @@ func buildKiroClient(authMgr *auth.AuthManager, cfg config.Config) kiroclient.Cl
 	return kiroclient.NewHTTPClient(clientOpts...)
 }
 
-func buildServer(conductor pool.Conductor, scheduler pool.Scheduler, agg usage.Aggregator, client kiroclient.Client, cfg config.Config, collector *dashboard.Collector, dashHandler *dashboard.Handler, registry *provider.Registry, settingsStore *settings.Store, geoResolver *georegion.Resolver) *server.Server {
+func buildServer(conductor pool.Conductor, scheduler pool.Scheduler, agg usage.Aggregator, client kiroclient.Client, cfg config.Config, collector *dashboard.Collector, dashHandler *dashboard.Handler, registry *provider.Registry, settingsStore *settings.Store, geoResolver *georegion.Resolver, promptCacheReportsExplicit bool) *server.Server {
 	var opts []server.ServerOption
 	if cfg.OTel {
 		opts = append(opts, server.WithOTel(cfg.OTelBodyLimit))
 	}
 	if cfg.Debug {
 		opts = append(opts, server.WithCapture(true))
+	}
+	if cfg.PromptCacheEnabled {
+		opts = append(opts, server.WithPromptCacheOptions(promptcache.Options{
+			Enabled:         true,
+			TargetReadRatio: cfg.PromptCacheTargetReadRatio,
+		}))
+	}
+	if !cfg.PromptCacheReports.Empty() {
+		opts = append(opts, server.WithPromptCacheReports(cfg.PromptCacheReports))
+	}
+	if settingsStore != nil && !promptCacheReportsExplicit {
+		opts = append(opts, server.WithPromptCacheReportProvider(func() promptcache.ReportConfig {
+			return settingsStore.Get().PromptCacheReports.Normalized()
+		}))
 	}
 	opts = append(opts, server.WithDashboard(dashHandler, collector))
 	if registry != nil {
@@ -309,6 +325,9 @@ func buildServer(conductor pool.Conductor, scheduler pool.Scheduler, agg usage.A
 				return k.ID, err
 			}
 			return k.ID, nil
+		}))
+		opts = append(opts, server.WithAPIKeyValidatorEnabled(func() bool {
+			return len(settingsStore.Get().APIKeys) > 0
 		}))
 		opts = append(opts, server.WithAPIKeyUsageRecorder(settingsStore.AddAPIKeyUsage))
 	}
@@ -333,57 +352,24 @@ func buildServer(conductor pool.Conductor, scheduler pool.Scheduler, agg usage.A
 	return server.New(conductor, scheduler, agg, cfg.APIKey, client, opts...)
 }
 
-// resolveSettingsPath returns the on-disk path for the runtime settings
-// store, or "" when settings persistence should be disabled.
-//
-// Priority:
-//  1. cfg.SettingsPath (-settings flag / KIROCC_SETTINGS env var)
-//  2. defaultSettingsPath() when admin is enabled (the admin UI is the
-//     only consumer; running headless without admin → no need to keep
-//     a settings file around)
-func resolveSettingsPath(cfg config.Config) string {
-	if cfg.SettingsPath != "" {
-		return cfg.SettingsPath
-	}
-	if cfg.AdminEnabled {
-		return settings.DefaultSettingsPath()
-	}
-	return ""
-}
-
-// [fork] buildPool returns a Scheduler + Conductor. When cfg.CredsJSON is
-// set, it loads the multi-account file and constructs a DefaultScheduler +
-// configured Selector + Conductor with session affinity. Otherwise it
-// returns the single-account adapter wrapping authMgr. The registry is
-// used by the multi-account refresher to dispatch RefreshToken per
-// credential's Provider.
-func buildPool(cfg config.Config, authMgr *auth.AuthManager, registry *provider.Registry) (pool.Scheduler, pool.Conductor, pool.Refresher, error) {
-	if cfg.CredsJSON == "" {
-		s, c, err := pool.NewSingleAccount(authMgr)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		slog.Info("pool: single-account mode (sqlite)")
-		return s, c, nil, nil
-	}
-	creds, err := pool.LoadFromJSON(cfg.CredsJSON)
+func buildPool(ctx context.Context, cfg config.Config, accountStore pool.CredentialStore, runtimeStore pool.RuntimeStateStore, registry *provider.Registry) (pool.Scheduler, pool.Conductor, pool.Refresher, error) {
+	creds, err := accountStore.Load(ctx)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("load creds %s: %w", cfg.CredsJSON, err)
+		return nil, nil, nil, fmt.Errorf("load postgres accounts: %w", err)
 	}
 	s := pool.NewDefaultScheduler()
+	s.SetRuntimeState(runtimeStore)
+	s.SetCredentialStore(accountStore)
 	s.Register(creds)
 	sel := pool.NewSelector(cfg.PoolStrategy)
 	aff := pool.NewAffinity(cfg.SessionAffinityTTL)
 	c := pool.NewConductor(s, sel, aff)
+	c.SetRuntimeState(runtimeStore, cfg.RedisLeaseTTL)
 
-	// [fork] Provider-aware refresher: routes RefreshToken via cred.Provider
-	// to the matching provider.Provider in the registry. Persists rotated
-	// tokens back to cfg.CredsJSON atomically.
-	refresher := provider.NewMultiRefresher(registry, cfg.CredsJSON, s.All)
+	refresher := provider.NewMultiRefresherWithPersister(registry, accountStore.SaveOne)
 	c.SetRefresher(refresher)
 
-	slog.Info("pool: multi-account mode",
-		"path", cfg.CredsJSON,
+	slog.Info("pool: postgres+redis mode",
 		"count", len(creds),
 		"strategy", cfg.PoolStrategy,
 		"providers", registry.Len(),
@@ -391,8 +377,7 @@ func buildPool(cfg config.Config, authMgr *auth.AuthManager, registry *provider.
 	return s, c, refresher, nil
 }
 
-// [fork] buildAggregator wires the in-memory ring with an optional SQLite
-// append log. The SQLite path is created (with parent dirs) if missing.
+// buildAggregator wires the in-memory ring with the PostgreSQL append log.
 // buildCodexHTTPClient returns an http.Client whose transport routes
 // every request through proxyURL. Empty proxyURL means "use
 // http.DefaultClient" (which falls back to HTTPS_PROXY env if set).
@@ -416,20 +401,13 @@ func buildCodexHTTPClient(proxyURL string) (*http.Client, error) {
 	return &http.Client{Transport: transport, Timeout: 60 * time.Second}, nil
 }
 
-func buildAggregator(cfg config.Config) (usage.Aggregator, error) {
+func buildAggregator(cfg config.Config, pgDB *sql.DB) (usage.Aggregator, error) {
 	mem := usage.NewMemoryStore(cfg.UsageMemCap)
-	var sql *usage.SQLiteStore
-	if cfg.UsageDB != "" {
-		if err := os.MkdirAll(filepath.Dir(cfg.UsageDB), 0o755); err != nil {
-			return nil, fmt.Errorf("mkdir usage db dir: %w", err)
-		}
-		s, err := usage.NewSQLiteStore(cfg.UsageDB)
-		if err != nil {
-			return nil, fmt.Errorf("open usage db: %w", err)
-		}
-		sql = s
+	pgStore, err := usage.NewPostgresStore(pgDB)
+	if err != nil {
+		return nil, err
 	}
-	return usage.NewAggregator(mem, sql), nil
+	return usage.NewAggregator(mem, pgStore), nil
 }
 
 func logStartupMetadata() {

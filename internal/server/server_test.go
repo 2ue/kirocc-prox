@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +18,9 @@ import (
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
 	"github.com/niuma/kirocc-pro/internal/models"
 	"github.com/niuma/kirocc-pro/internal/pool"
+	"github.com/niuma/kirocc-pro/internal/promptcache"
 	tu "github.com/niuma/kirocc-pro/internal/testutil"
+	"github.com/niuma/kirocc-pro/internal/usage"
 )
 
 // stubConductor returns a fixed Credential, or an error when acquireErr is
@@ -33,7 +37,7 @@ func (s *stubConductor) Acquire(_ context.Context, _, _ string) (*pool.Credentia
 	}
 	return s.cred, nil
 }
-func (s *stubConductor) Release(_ *pool.Credential) {}
+func (s *stubConductor) Release(_ *pool.Credential, _ ...string) {}
 
 // newStubCred returns the default test credential used across server tests.
 func newStubCred() *pool.Credential {
@@ -51,18 +55,18 @@ func newStubCred() *pool.Credential {
 // scheduler state.
 type stubScheduler struct{}
 
-func (stubScheduler) Register(_ []*pool.Credential)                       {}
-func (stubScheduler) Ready() []*pool.Credential                           { return nil }
-func (stubScheduler) Lookup(_ string) *pool.Credential                    { return nil }
-func (stubScheduler) All() []*pool.Credential                             { return nil }
-func (stubScheduler) MarkSuccess(_, _ string, _ pool.Usage)               {}
-func (stubScheduler) MarkRateLimit(_, _ string, _ time.Duration)          {}
-func (stubScheduler) MarkAuthError(_, _ string)                           {}
-func (stubScheduler) RefreshQuota(_ string, _ *pool.KiroQuotaSnapshot)    {}
-func (stubScheduler) RecordQuotaError(_, _ string)                        {}
-func (stubScheduler) SetEnabled(_ string, _ bool) error                   { return nil }
-func (stubScheduler) Add(_ *pool.Credential) error                        { return nil }
-func (stubScheduler) Remove(_ string) error                               { return nil }
+func (stubScheduler) Register(_ []*pool.Credential)                    {}
+func (stubScheduler) Ready() []*pool.Credential                        { return nil }
+func (stubScheduler) Lookup(_ string) *pool.Credential                 { return nil }
+func (stubScheduler) All() []*pool.Credential                          { return nil }
+func (stubScheduler) MarkSuccess(_, _ string, _ pool.Usage)            {}
+func (stubScheduler) MarkRateLimit(_, _ string, _ time.Duration)       {}
+func (stubScheduler) MarkAuthError(_, _ string)                        {}
+func (stubScheduler) RefreshQuota(_ string, _ *pool.KiroQuotaSnapshot) {}
+func (stubScheduler) RecordQuotaError(_, _ string)                     {}
+func (stubScheduler) SetEnabled(_ string, _ bool) error                { return nil }
+func (stubScheduler) Add(_ *pool.Credential) error                     { return nil }
+func (stubScheduler) Remove(_ string) error                            { return nil }
 
 // mockKiroClient implements kiroclient.Client for tests.
 type mockKiroClient struct {
@@ -86,6 +90,11 @@ func buildEventStream(events ...any) io.ReadCloser {
 
 func newTestServer(t *testing.T, apiKey string, client kiroclient.Client) *httptest.Server {
 	t.Helper()
+	return newTestServerWithOptions(t, apiKey, client)
+}
+
+func newTestServerWithOptions(t *testing.T, apiKey string, client kiroclient.Client, opts ...ServerOption) *httptest.Server {
+	t.Helper()
 	conductor := &stubConductor{cred: newStubCred()}
 	if client == nil {
 		client = &mockKiroClient{
@@ -96,8 +105,66 @@ func newTestServer(t *testing.T, apiKey string, client kiroclient.Client) *httpt
 			},
 		}
 	}
-	s := New(conductor, stubScheduler{}, nil, apiKey, client)
+	s := New(conductor, stubScheduler{}, nil, apiKey, client, opts...)
 	return newTCP4TestServer(t, s.Handler())
+}
+
+func TestAuthRejectedMessagesAreRecordedInUsage(t *testing.T) {
+	agg := usage.NewAggregator(usage.NewMemoryStore(10), nil)
+	defer func() { _ = agg.Close() }()
+	s := New(&stubConductor{cred: newStubCred()}, stubScheduler{}, agg, "secret", nil)
+	srv := newTCP4TestServer(t, s.Handler())
+	defer srv.Close()
+
+	resp := postMessages(t, srv.URL, `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`)
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, http.StatusUnauthorized)
+	_, _ = io.ReadAll(resp.Body)
+
+	records, err := agg.Recent(context.Background(), usage.Filter{}, 10)
+	if err != nil {
+		t.Fatalf("recent usage: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	if records[0].Status != usage.StatusAuthError || records[0].RequestPath != "/v1/messages" {
+		t.Fatalf("record = %+v, want auth_error on /v1/messages", records[0])
+	}
+
+	resp2, err := http.Get(srv.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("GET /v1/models: %v", err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	requireStatus(t, resp2, http.StatusUnauthorized)
+	_, _ = io.ReadAll(resp2.Body)
+	records, _ = agg.Recent(context.Background(), usage.Filter{}, 10)
+	if len(records) != 1 {
+		t.Fatalf("records after /v1/models auth failure = %d, want still 1", len(records))
+	}
+}
+
+func TestDynamicAPIKeyValidatorDisabledAllowsUnauthenticatedModels(t *testing.T) {
+	called := false
+	srv := newTestServerWithOptions(t, "", nil,
+		WithAPIKeyValidator(func(string) (string, error) {
+			called = true
+			return "", errors.New("validator should be disabled")
+		}),
+		WithAPIKeyValidatorEnabled(func() bool { return false }),
+	)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("GET /v1/models: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, http.StatusOK)
+	if called {
+		t.Fatal("dynamic validator was called while disabled")
+	}
 }
 
 func TestHealth(t *testing.T) {
@@ -317,6 +384,175 @@ func TestPostMessages_InvalidJSON(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 400 {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestPostMessages_ProfilePrefixRoute(t *testing.T) {
+	p1, _ := json.Marshal(map[string]string{"content": "ok"})
+	client := &mockKiroClient{handler: func(ctx context.Context, token string, payload *kiroproto.Payload, region string) (*kiroclient.Response, error) {
+		body := buildEventStream("assistantResponseEvent", p1)
+		return &kiroclient.Response{StatusCode: 200, Body: body, Header: http.Header{}, PromptTokens: 10}, nil
+	}}
+	cfg := promptcache.ReportConfig{
+		Routes: map[string]string{"custom-a": "custom-a"},
+		Profiles: map[string]promptcache.ReportProfile{
+			"custom-a": {Enabled: true},
+		},
+	}
+	srv := newTestServerWithOptions(t, "", client, WithPromptCacheReports(cfg))
+	defer srv.Close()
+
+	resp := postMessagesPath(t, srv.URL, "/api/custom-a/v1/messages", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+
+	legacyResp := postMessagesPath(t, srv.URL, "/custom-a/v1/messages", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	defer func() { _ = legacyResp.Body.Close() }()
+	if legacyResp.StatusCode != 404 {
+		body, _ := io.ReadAll(legacyResp.Body)
+		t.Fatalf("legacy status = %d, want 404, body = %s", legacyResp.StatusCode, body)
+	}
+
+	modelsResp, err := http.Get(srv.URL + "/api/custom-a/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = modelsResp.Body.Close() }()
+	if modelsResp.StatusCode != 200 {
+		body, _ := io.ReadAll(modelsResp.Body)
+		t.Fatalf("models status = %d, body = %s", modelsResp.StatusCode, body)
+	}
+
+	modelsPostResp, err := http.Post(srv.URL+"/api/custom-a/v1/models", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = modelsPostResp.Body.Close() }()
+	if modelsPostResp.StatusCode != 405 {
+		body, _ := io.ReadAll(modelsPostResp.Body)
+		t.Fatalf("models POST status = %d, want 405, body = %s", modelsPostResp.StatusCode, body)
+	}
+
+	countResp := postMessagesPath(t, srv.URL, "/api/custom-a/v1/messages/count_tokens/", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`)
+	defer func() { _ = countResp.Body.Close() }()
+	if countResp.StatusCode != 200 {
+		body, _ := io.ReadAll(countResp.Body)
+		t.Fatalf("count_tokens status = %d, body = %s", countResp.StatusCode, body)
+	}
+
+	trailingResp := postMessagesPath(t, srv.URL, "/api/custom-a/v1/messages/", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	defer func() { _ = trailingResp.Body.Close() }()
+	if trailingResp.StatusCode != 200 {
+		body, _ := io.ReadAll(trailingResp.Body)
+		t.Fatalf("trailing status = %d, body = %s", trailingResp.StatusCode, body)
+	}
+}
+
+func TestPostMessages_UnconfiguredProfilePrefixRouteNotFound(t *testing.T) {
+	srv := newTestServer(t, "", nil)
+	defer srv.Close()
+
+	resp := postMessagesPath(t, srv.URL, "/api/custom-a/v1/messages", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 404 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 404, body = %s", resp.StatusCode, body)
+	}
+}
+
+func TestPromptCacheReportProviderControlsProfileRoutes(t *testing.T) {
+	staticCfg := promptcache.ReportConfig{
+		Routes: map[string]string{"custom-a": "custom-a"},
+		Profiles: map[string]promptcache.ReportProfile{
+			"custom-a": {Enabled: true},
+		},
+	}
+
+	var (
+		mu  sync.RWMutex
+		cfg promptcache.ReportConfig
+	)
+	setConfig := func(next promptcache.ReportConfig) {
+		mu.Lock()
+		defer mu.Unlock()
+		cfg = next
+	}
+	provider := func() promptcache.ReportConfig {
+		mu.RLock()
+		defer mu.RUnlock()
+		return cfg
+	}
+
+	srv := newTestServerWithOptions(t, "", nil,
+		WithPromptCacheReports(staticCfg),
+		WithPromptCacheReportProvider(provider),
+	)
+	defer srv.Close()
+
+	assertModelsStatus := func(want int) {
+		t.Helper()
+		resp, err := http.Get(srv.URL + "/api/custom-a/v1/models")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != want {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("models status = %d, want %d, body = %s", resp.StatusCode, want, body)
+		}
+	}
+
+	assertModelsStatus(http.StatusNotFound)
+	setConfig(staticCfg)
+	assertModelsStatus(http.StatusOK)
+	setConfig(promptcache.ReportConfig{})
+	assertModelsStatus(http.StatusNotFound)
+}
+
+func TestPostMessages_CustomDashboardNamedRouteUsesAPIPrefix(t *testing.T) {
+	p1, _ := json.Marshal(map[string]string{"content": "ok"})
+	client := &mockKiroClient{handler: func(ctx context.Context, token string, payload *kiroproto.Payload, region string) (*kiroclient.Response, error) {
+		body := buildEventStream("assistantResponseEvent", p1)
+		return &kiroclient.Response{StatusCode: 200, Body: body, Header: http.Header{}, PromptTokens: 10}, nil
+	}}
+	cfg := promptcache.ReportConfig{
+		Routes: map[string]string{"dashboard/custom-a": "custom-a"},
+		Profiles: map[string]promptcache.ReportProfile{
+			"custom-a": {Enabled: true},
+		},
+	}
+	srv := newTestServerWithOptions(t, "", client, WithPromptCacheReports(cfg))
+	defer srv.Close()
+
+	resp := postMessagesPath(t, srv.URL, "/api/dashboard/custom-a/v1/messages", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+
+	frontendResp := postMessagesPath(t, srv.URL, "/dashboard/custom-a/v1/messages", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	defer func() { _ = frontendResp.Body.Close() }()
+	if frontendResp.StatusCode != 404 {
+		body, _ := io.ReadAll(frontendResp.Body)
+		t.Fatalf("frontend status = %d, want 404, body = %s", frontendResp.StatusCode, body)
+	}
+}
+
+func TestPostMessages_UnknownProfilePathNotFound(t *testing.T) {
+	srv := newTestServer(t, "", nil)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/api/custom-a/not-messages", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 404 {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 }
 

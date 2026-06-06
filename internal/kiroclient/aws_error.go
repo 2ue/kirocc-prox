@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // UpstreamError is returned when the Kiro API responds with an HTTP error
@@ -16,11 +18,33 @@ type UpstreamError struct {
 	ContentType string // Content-Type header value
 	Exception   string // AWS exception class (normalized, may be "")
 	Body        string // response body (up to 8 KiB)
+	RetryAfter  time.Duration
 }
 
 func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("kiro api: status=%d content_type=%q exception=%q: %s",
 		e.Status, e.ContentType, e.Exception, e.Body)
+}
+
+func parseRetryAfter(raw string, now time.Time) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	t, err := http.ParseTime(raw)
+	if err != nil {
+		return 0
+	}
+	if !t.After(now) {
+		return 0
+	}
+	return t.Sub(now)
 }
 
 // parseAWSExceptionType extracts the AWS exception type from an error body.

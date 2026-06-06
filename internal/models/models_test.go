@@ -169,7 +169,7 @@ func TestResolve(t *testing.T) {
 			model:              "gpt-4o",
 			wantKiroModel:      DefaultModel,
 			wantContextWindow:  DefaultContextWindowSize,
-			wantAnthropicModel: "claude-sonnet-4-6",
+			wantAnthropicModel: DefaultAnthropicModel,
 		},
 		{
 			name:               "env override custom model",
@@ -193,7 +193,7 @@ func TestResolve(t *testing.T) {
 			model:              "gpt-4o",
 			wantKiroModel:      DefaultModel,
 			wantContextWindow:  DefaultContextWindowSize,
-			wantAnthropicModel: "claude-sonnet-4-6",
+			wantAnthropicModel: DefaultAnthropicModel,
 		},
 		{
 			name:               "env override with already-suffixed anthropic does not double-suffix at 1m",
@@ -268,6 +268,9 @@ func TestListModels(t *testing.T) {
 
 			if tt.checkModel != "" && !slices.Contains(result, tt.checkModel) {
 				t.Errorf("ListModels missing expected model %q", tt.checkModel)
+			}
+			if tt.envMappings == "" && slices.Contains(result, "claude-sonnet-4.6") {
+				t.Error("ListModels advertised claude-sonnet-4.6, but real Kiro upstream rejects it")
 			}
 		})
 	}

@@ -4,7 +4,7 @@
 
   const REFRESH_MS = 30_000;
   const AUTO_KEY = "kirocc.admin.autoRefresh";
-  const PAGES = ["dashboard", "accounts", "credsfile", "stats", "settings"];
+  const PAGES = ["dashboard", "accounts", "stats", "settings"];
 
   let refreshTimer = null;
   let currentPage = "dashboard";
@@ -134,8 +134,6 @@
     const openBanner = $("openModeBanner");
     if (openBanner) openBanner.hidden = h.admin_key_set !== false;
     multiAccount = !!h.multi_account;
-    const singleBanner = $("singleModeBanner");
-    if (singleBanner) singleBanner.hidden = multiAccount;
     const actions = $("accountsActions");
     if (actions) actions.hidden = !multiAccount;
   }
@@ -145,18 +143,34 @@
     cooldown: "冷却中",
     disabled: "已禁用",
     banned: "已封禁",
+    success: "成功",
+    invalid_request: "请求错误",
+    rate_limited: "限流",
+    auth_error: "认证错误",
+    upstream_error: "上游错误",
     unknown: "未知",
   };
 
   function statusPill(s) {
-    const key = s || "disabled";
-    return el("span", { class: "pill " + key }, STATUS_CN[key] || STATUS_CN.unknown);
+    const raw = String(s || "").trim();
+    const key = raw || "unknown";
+    const safeClass = STATUS_CN[key] ? key : "unknown";
+    return el("span", { class: "pill " + safeClass, title: raw || "unknown" },
+      STATUS_CN[key] || raw || STATUS_CN.unknown);
+  }
+
+  function compactText(s, maxLen = 120) {
+    s = String(s || "").replace(/\s+/g, " ").trim();
+    if (!s) return "";
+    if (s.length <= maxLen) return s;
+    return s.slice(0, maxLen - 3) + "...";
   }
 
   // Active region filter for the accounts page. "" = 全部.
   let accountsRegionFilter = "";
   // Last loaded rows (so a filter chip click can re-render without refetch).
   let accountsLastRows = [];
+  let refreshAllQuotaRunning = false;
 
   function renderAccounts(rows) {
     accountsLastRows = rows || [];
@@ -262,6 +276,21 @@
     return Math.max(0, Math.ceil((t - Date.now()) / 86_400_000));
   }
 
+  function capacityLabel(r) {
+    const current = Number(r && r.in_flight) || 0;
+    const max = Number(r && r.max_in_flight) || 0;
+    return max > 0 ? `${fmtNum(current)} / ${fmtNum(max)}` : `${fmtNum(current)} / unlimited`;
+  }
+
+  function modelCapacityLabel(r) {
+    const byModel = (r && r.in_flight_by_model) || {};
+    return Object.keys(byModel)
+      .filter(k => byModel[k] > 0)
+      .sort()
+      .map(k => `${k}: ${fmtNum(byModel[k])}`)
+      .join(" · ");
+  }
+
   function buildAccountCard(r) {
     const c = r.credits || {};
     const total = c.total || 0;
@@ -365,6 +394,9 @@
       const bonusRem = r.bonus.total - r.bonus.used;
       addCycle("赠送", `${fmtNum(bonusRem)} / ${fmtNum(r.bonus.total)} · ${r.bonus.expires_in_days}d`);
     }
+    addCycle("并发", capacityLabel(r));
+    const modelCapacity = modelCapacityLabel(r);
+    if (modelCapacity) addCycle("模型并发", modelCapacity);
     if (r.status === "cooldown" && r.cooldown_until && !isZeroTime(r.cooldown_until)) {
       addCycle("冷却至", fmtRelative(r.cooldown_until));
     }
@@ -610,7 +642,7 @@
     body.replaceChildren();
     if (all.length === 0) {
       body.appendChild(el("tr", { class: "empty" },
-        el("td", { colspan: "11", class: "muted" }, "暂无请求记录")));
+        el("td", { colspan: "16", class: "muted" }, "暂无请求记录")));
       $("recentMeta").textContent = "0 条";
       $("recentPagination").hidden = true;
       return;
@@ -624,24 +656,53 @@
     const slice = all.slice(start, start + pageSize);
 
     for (const r of slice) {
-      const total = (r.input_tokens || 0) + (r.output_tokens || 0);
+      const input = r.input_tokens || 0;
+      const output = r.output_tokens || 0;
+      const cacheRead = r.cache_read_tokens || 0;
+      const cacheWrite = r.cache_write_tokens || 0;
+      const total = input + output + cacheRead + cacheWrite;
+      const rawInput = r.raw_input_tokens ?? input;
+      const rawOutput = r.raw_output_tokens ?? output;
+      const rawCacheRead = r.raw_cache_read_tokens ?? cacheRead;
+      const rawCacheWrite = r.raw_cache_write_tokens ?? cacheWrite;
+      const profileDisp = r.prompt_cache_profile
+        ? `${r.prompt_cache_profile}${r.prompt_cache_prefix ? "\n" + r.prompt_cache_prefix : ""}`
+        : "—";
       const keyDisp = r.api_key_label
         ? `${r.api_key_label}\n${r.api_key_id?.slice(0, 8) || ''}`
         : (r.api_key_id ? r.api_key_id.slice(0, 8) : '（legacy）');
+      const credDisp = r.credential_label
+        ? r.credential_label
+        : (r.credential_id ? r.credential_id.slice(0, 12) : "（未调度）");
+      const errorMessage = compactText(r.error_message);
 
       body.appendChild(el("tr", {},
         el("td", { class: "mono small" }, fmtTime(r.timestamp)),
+        el("td", { class: "mono small", title: r.request_path || "" }, r.request_path || "—"),
         el("td", { class: "mono small" }, r.resolved_model || r.requested_model || "—"),
+        el("td", { class: "mono small", title: r.prompt_cache_prefix || "" }, profileDisp),
         el("td", { class: "mono small", title: r.api_key_id || "" }, keyDisp),
+        el("td", { class: "mono small", title: r.credential_id || "" }, credDisp),
         el("td", {
           class: "mono small",
           title: r.device_id ? `指纹 ${r.device_id}` : "",
         }, r.device || (r.device_id ? r.device_id.slice(0, 8) : "—")),
         el("td", {}, statusPill(r.status)),
         el("td", { class: "num mono" }, r.latency_ms > 0 ? fmtLatency(r.latency_ms) : "—"),
-        el("td", { class: "num mono" }, fmtNum(r.input_tokens || 0)),
-        el("td", { class: "num mono" }, fmtNum(r.output_tokens || 0)),
+        el("td", { class: "num mono" }, r.first_token_ms > 0 ? fmtLatency(r.first_token_ms) : "—"),
+        tokenCell(input, rawInput),
+        tokenCell(output, rawOutput),
+        tokenCell(cacheRead, rawCacheRead),
+        tokenCell(cacheWrite, rawCacheWrite),
         el("td", { class: "num mono" }, fmtNum(total)),
+        el("td", {
+          class: "mono small recent-error" + (errorMessage ? " has-error" : ""),
+          title: r.error_message || "",
+        }, errorMessage ? el("button", {
+          class: "recent-error-preview",
+          type: "button",
+          onclick: () => openErrorDetail(r.error_message),
+        }, errorMessage) : "—"),
       ));
     }
 
@@ -657,6 +718,22 @@
     $("recentPrev").disabled  = recentPage === 1;
     $("recentNext").disabled  = recentPage === totalPages;
     $("recentLast").disabled  = recentPage === totalPages;
+  }
+
+  function tokenCell(reported, raw) {
+    reported = Number(reported || 0);
+    raw = Number(raw || 0);
+    const changed = reported !== raw;
+    return el("td", {
+      class: "num mono" + (changed ? " token-adjusted" : ""),
+      title: changed ? `上报 ${fmtNum(reported)}\n原始 ${fmtNum(raw)}` : "",
+    }, fmtNum(reported) + (changed ? "*" : ""));
+  }
+
+  function openErrorDetail(message) {
+    const text = $("errorDetailText");
+    if (text) text.textContent = message || "—";
+    openDialog("errorDetailDialog");
   }
 
   // Pagination actions
@@ -680,12 +757,17 @@
   function refreshRecentFilterOptions(rows) {
     const modelSet = new Set();
     const keySet = new Map(); // id → label
+    const credSet = new Map(); // id → label
     for (const r of rows) {
       if (r.resolved_model) modelSet.add(r.resolved_model);
       if (r.api_key_id) keySet.set(r.api_key_id, r.api_key_label || r.api_key_id);
+      if (r.credential_id) credSet.set(r.credential_id, r.credential_label || r.credential_id);
     }
     syncSelect("recentModel", [...modelSet].sort(), (v) => v);
     syncSelect("recentKey",   [...keySet.entries()].sort(),
+      ([id, _label]) => id,
+      ([_id, label]) => label);
+    syncSelect("recentCred", [...credSet.entries()].sort(),
       ([id, _label]) => id,
       ([_id, label]) => label);
   }
@@ -709,9 +791,12 @@
   function exportRecentCSV() {
     if (recentLastRows.length === 0) { toast("没有数据可导出", "error"); return; }
     const cols = [
-      "timestamp", "resolved_model", "requested_model", "api_key_id",
-      "api_key_label", "device_id", "device", "status", "latency_ms",
-      "input_tokens", "output_tokens", "credential_id", "trace_id",
+      "timestamp", "request_path", "prompt_cache_profile", "prompt_cache_prefix",
+      "resolved_model", "requested_model", "api_key_id",
+      "api_key_label", "credential_id", "credential_label", "device_id", "device", "status", "latency_ms",
+      "first_token_ms", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+      "raw_input_tokens", "raw_output_tokens", "raw_cache_read_tokens", "raw_cache_write_tokens",
+      "error_message", "trace_id",
     ];
     const esc = (v) => {
       if (v == null) return "";
@@ -783,7 +868,7 @@
 
   // Range presets, ordered to match the button group. Bucket sizes chosen
   // so each range yields 24–48 columns — enough resolution to read,
-  // not so many that small SQLite scans get slow.
+  // not so many that recent-history scans get noisy.
   const TOKEN_CHART_RANGES = {
     "24h": { window: "24h",  bucket: "1h"  },
     "7d":  { window: "168h", bucket: "4h"  },
@@ -1190,7 +1275,7 @@
     finally { loadAccounts(); loadHealth(); }
   }
   async function onDelete(id, label) {
-    if (!confirm(`确定要删除账号 "${label || id}" 吗？此操作会从 JSON 文件移除该条目。`)) return;
+    if (!confirm(`确定要删除账号 "${label || id}" 吗？此操作会从 PostgreSQL 移除该条目。`)) return;
     try {
       const r = await apiFetch(`/admin/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -1203,14 +1288,47 @@
     }
   }
   async function onRefreshAllQuota() {
-    const rows = document.querySelectorAll("#accountsBody tr[data-id]");
-    if (rows.length === 0) return;
-    toast(`正在刷新 ${rows.length} 个账号的配额…`);
-    for (const r of rows) {
-      try { await postJSON(`/admin/accounts/${encodeURIComponent(r.dataset.id)}/refresh`); }
-      catch (e) { console.warn("refresh failed", r.dataset.id, e); }
+    if (refreshAllQuotaRunning) {
+      toast("配额刷新队列正在执行中…");
+      return;
     }
-    toast("配额已批量刷新", "success");
+    const rows = (accountsLastRows || []).filter(r =>
+      !accountsRegionFilter || (r.region || "") === accountsRegionFilter);
+    const ids = rows.map(r => r.id).filter(Boolean);
+    if (ids.length === 0) {
+      toast("没有可刷新的账号", "error");
+      return;
+    }
+
+    const btn = $("btnRefreshAllQuota");
+    const oldText = btn ? btn.textContent : "";
+    refreshAllQuotaRunning = true;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = `刷新中 0/${ids.length}`;
+    }
+    toast(`已加入刷新队列：${ids.length} 个账号，将逐个刷新配额…`);
+
+    let ok = 0;
+    let failed = 0;
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      if (btn) btn.textContent = `刷新中 ${i + 1}/${ids.length}`;
+      try {
+        await postJSON(`/admin/accounts/${encodeURIComponent(id)}/refresh`);
+        ok++;
+      } catch (e) {
+        failed++;
+        console.warn("refresh failed", id, e);
+      }
+    }
+
+    refreshAllQuotaRunning = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = oldText || "↻ 刷新全部配额";
+    }
+    toast(`配额刷新完成：成功 ${ok} · 失败 ${failed}`, failed ? "error" : "success");
     loadAccounts();
     loadHealth();
   }
@@ -1240,6 +1358,7 @@
       add("status",     "recentStatus");
       add("model",      "recentModel");
       add("api_key_id", "recentKey");
+      add("cred_id",    "recentCred");
       renderRecent(await getJSON("/admin/usage/recent?" + params.toString()));
     } catch (e) { console.warn(e); }
   }
@@ -1252,7 +1371,6 @@
       loadTokenChart(tokenChartRangeKey);
     }
     if (currentPage === "accounts")  loadAccounts();
-    if (currentPage === "credsfile") loadCredsFile();
     if (currentPage === "stats")     { loadUsage(); loadRecent(); }
     if (currentPage === "settings")  { loadSettings(); loadAPIKeys(); loadOptimizations(); }
   }
@@ -1260,7 +1378,7 @@
   // ---------- tab routing -----------------------------------------------
 
   // Settings sub-sections, ordered to match the sidebar sub-nav.
-  const SETTINGS_SECTIONS = ["runtime", "auth", "remote", "system", "network", "streaming", "optimizations", "api"];
+  const SETTINGS_SECTIONS = ["runtime", "auth", "remote", "system", "network", "streaming", "prompt-cache", "optimizations", "api"];
   let currentSection = "runtime";
 
   function navigateTo(page, section) {
@@ -1300,177 +1418,12 @@
 
   // ---------- 配额 page ------------------------------------------------
 
-  // ---------- 认证文件 page --------------------------------------------
-
-  let credsFileLoaded = false;
-
-  function fmtBytes(n) {
-    if (!n || n < 0) return "—";
-    if (n < 1024) return n + " B";
-    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
-    return (n / (1024 * 1024)).toFixed(2) + " MB";
-  }
-
-  async function loadCredsFile() {
-    const editor = $("credsEditor");
-    const cardsHost = $("credsCards");
-    if (!editor && !cardsHost) return;
-    try {
-      const r = await apiFetch("/admin/credsfile");
-      if (r.status === 404) {
-        $("credsPath").textContent = "—";
-        $("credsSize").textContent = "—";
-        $("credsMtime").textContent = "—";
-        if ($("credsCount")) $("credsCount").textContent = "—";
-        if (editor) {
-          editor.value = "// single-account mode — no credentials JSON in use.\n// 启动时附加 -creds-json <path> 以启用多账号池.";
-          editor.disabled = true;
-        }
-        if (cardsHost) {
-          cardsHost.replaceChildren(el("div", { class: "cards-empty muted" },
-            "single-account mode — credentials file not in use"));
-        }
-        $("credsFileActions").hidden = true;
-        return;
-      }
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      const data = await r.json();
-      $("credsPath").textContent = data.path || "—";
-      $("credsSize").textContent = data.exists ? fmtBytes(data.size) : "(missing)";
-      $("credsMtime").textContent = data.last_modified && !isZeroTime(data.last_modified)
-        ? new Date(data.last_modified).toLocaleString()
-        : "—";
-      let entries = [];
-      try { entries = data.content ? JSON.parse(data.content) : []; }
-      catch (_) { entries = []; }
-      if (!Array.isArray(entries)) entries = [];
-      if ($("credsCount")) $("credsCount").textContent = entries.length;
-      renderCredsCards(entries);
-      if (editor && !credsFileLoaded) {
-        editor.value = data.content || "";
-        editor.disabled = false;
-        credsFileLoaded = true;
-      }
-    } catch (e) {
-      toast("读取认证文件失败：" + e.message, "error");
-    }
-  }
-
-  function renderCredsCards(entries) {
-    const host = $("credsCards");
-    if (!host) return;
-    host.replaceChildren();
-    if (entries.length === 0) {
-      host.appendChild(el("div", { class: "cards-empty muted" }, "no credentials"));
-      return;
-    }
-    for (const c of entries) {
-      const tok = c.kiro_auth_token_raw || {};
-      const expIso = tok.expiresAt || "";
-      const expDate = expIso ? new Date(expIso) : null;
-      const expired = expDate && expDate.getTime() < Date.now();
-      const card = el("div", {
-        class: "creds-card" +
-          (c.disabled ? " is-disabled" : "") +
-          (expired ? " is-expired" : ""),
-      });
-      card.appendChild(el("div", { class: "creds-card-head" },
-        el("div", {},
-          el("div", { class: "creds-card-id" }, c.id || "(no id)"),
-          c.label ? el("div", { class: "creds-card-label" }, c.label) : null,
-        ),
-        el("span", { class: "chip-provider" }, c.provider || "kiro"),
-      ));
-      const rows = el("dl", { class: "creds-card-rows" });
-      const addRow = (k, v, cls) => {
-        if (v == null || v === "") return;
-        rows.appendChild(el("dt", {}, k));
-        rows.appendChild(el("dd", cls ? { class: cls } : {}, String(v)));
-      };
-      addRow("auth", tok.authMethod || "—", "cyan");
-      addRow("region", tok.region || tok.ssoRegion || "—");
-      addRow("expires", expDate ? (expired ? "EXPIRED · " : "") + fmtRelative(expIso) : "—",
-        expired ? null : "neon");
-      addRow("priority", typeof c.priority === "number" ? c.priority : "—");
-      addRow("status", c.disabled ? "disabled" : (expired ? "expired" : "active"));
-      card.appendChild(rows);
-      card.appendChild(el("div", { class: "creds-card-actions" },
-        el("button", {
-          class: "btn tiny",
-          type: "button",
-          onclick: () => copyToken(tok.accessToken),
-        }, "复制 token"),
-        el("button", {
-          class: "btn tiny",
-          type: "button",
-          onclick: () => copyToClipboard(JSON.stringify(c, null, 2)),
-        }, "复制 JSON"),
-      ));
-      host.appendChild(card);
-    }
-  }
-
-  function copyToken(t) {
-    if (!t) { toast("无 access token", "error"); return; }
-    copyToClipboard(t, "已复制 access token");
-  }
-
   function copyToClipboard(text, okMsg) {
     if (!text) { toast("无内容", "error"); return; }
     navigator.clipboard.writeText(text).then(
       () => toast(okMsg || "已复制", "success"),
       () => toast("复制失败", "error"),
     );
-  }
-
-  async function saveCredsFile() {
-    const editor = $("credsEditor");
-    if (!editor) return;
-    const content = editor.value.trim();
-    if (!content) { toast("内容为空，未保存", "error"); return; }
-    try { JSON.parse(content); }
-    catch (e) { toast("JSON 解析失败：" + e.message, "error"); return; }
-    if (!confirm("覆盖磁盘上的凭据文件？该操作会立即生效于运行中的代理。")) return;
-    try {
-      const r = await apiFetch("/admin/credsfile", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content }),
-      });
-      const text = await r.text();
-      if (!r.ok) throw new Error(text);
-      let result = {};
-      try { result = JSON.parse(text); } catch (_) {}
-      toast(`已保存 ${result.count || "?"} 个账号到 ${result.path || ""}`, "success");
-      credsFileLoaded = false;
-      loadCredsFile();
-      loadAccounts();
-      loadHealth();
-    } catch (e) {
-      toast("保存失败：" + e.message, "error");
-    }
-  }
-
-  function bindCredsFilePage() {
-    $("btnCredsReload")?.addEventListener("click", () => {
-      credsFileLoaded = false;
-      loadCredsFile();
-    });
-    $("btnCredsDownload")?.addEventListener("click", () => {
-      location.href = "/admin/credsfile/download";
-    });
-    $("btnCredsUpload")?.addEventListener("click", () => $("credsFileUpload").click());
-    $("credsFileUpload")?.addEventListener("change", (ev) => {
-      const f = ev.target.files[0];
-      if (!f) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        $("credsEditor").value = reader.result;
-        toast("文件已加载到编辑器，点击「保存编辑」生效", "success");
-      };
-      reader.readAsText(f);
-    });
-    $("btnCredsSave")?.addEventListener("click", saveCredsFile);
   }
 
   // ---------- toast ------------------------------------------------------
@@ -1509,10 +1462,509 @@
     return e.value;
   }
 
+  const PC_FIELD_MODES = [
+    ["preserve", "保留计算值"],
+    ["raw", "原始值"],
+    ["sample-max", "上限采样"],
+    ["sample-target", "目标采样"],
+  ];
+
+  const PC_FIELD_LABELS = {
+    input: "输入上报",
+    output: "输出上报",
+    cache_read: "缓存读取上报",
+    cache_creation: "缓存创建上报",
+  };
+  let promptCacheDirty = false;
+  let promptCacheDraft = {};
+
+  function cloneJSON(v) {
+    return v == null ? {} : JSON.parse(JSON.stringify(v));
+  }
+
+  function prettyJSON(v) {
+    return JSON.stringify(v || {}, null, 2);
+  }
+
+  function promptCachePresetConfig() {
+    const base = {
+      enabled: true,
+      simulate_cache: true,
+      synthesize_stable_prefix: true,
+      target_read_ratio: 0.95,
+      token_scale: 1.6,
+      max_simulated_input_tokens: 300000,
+      cap_jitter_min_tokens: 12000,
+      cap_jitter_max_tokens: 24000,
+      scale_min_input_tokens: 20000,
+      input: { mode: "raw" },
+      output: { mode: "raw" },
+      cache_read: { mode: "preserve" },
+      cache_creation: { mode: "preserve" },
+    };
+    return {
+      routes: {
+        "/v1/messages": "default",
+        "/api/cc": "cc",
+        "/api/ha": "ha",
+        "/api/na": "na",
+      },
+      profiles: {
+        default: { ...base },
+        cc: {
+          ...base,
+          input: {
+            mode: "sample-max",
+            max_tokens: 256,
+            move_delta_to_cache_read: true,
+          },
+          output: { mode: "raw" },
+          cache_read: { mode: "preserve" },
+          cache_creation: {
+            mode: "sample-target",
+            target_tokens: 3000,
+            normal_max_multiplier: 1.2,
+          },
+        },
+        ha: {
+          ...base,
+          input: {
+            mode: "sample-max",
+            max_tokens: 256,
+            move_delta_to_cache_read: true,
+          },
+        },
+        na: {
+          ...base,
+          enabled: false,
+          simulate_cache: false,
+        },
+      },
+    };
+  }
+
+  function normalizePromptCacheConfig(cfg) {
+    cfg = cloneJSON(cfg || {});
+    if (!cfg.routes || typeof cfg.routes !== "object" || Array.isArray(cfg.routes)) cfg.routes = {};
+    if (!cfg.profiles || typeof cfg.profiles !== "object" || Array.isArray(cfg.profiles)) cfg.profiles = {};
+    if (cfg.default_profile == null) delete cfg.default_profile;
+    return cfg;
+  }
+
+  function inputNode(className, value, attrs) {
+    const n = el("input", Object.assign({ class: className, type: "text" }, attrs || {}));
+    n.value = value == null ? "" : String(value);
+    return n;
+  }
+
+  function numberNode(className, value, attrs) {
+    const n = el("input", Object.assign({ class: className, type: "number" }, attrs || {}));
+    n.value = value == null ? "" : String(value);
+    return n;
+  }
+
+  function selectNode(className, value, options) {
+    const s = el("select", { class: className });
+    for (const [v, label] of options) {
+      const opt = el("option", { value: v }, label);
+      if (v === value) opt.selected = true;
+      s.appendChild(opt);
+    }
+    return s;
+  }
+
+  function renderPromptCacheConfig(rawCfg) {
+    const cfg = normalizePromptCacheConfig(rawCfg);
+    promptCacheDraft = cloneJSON(cfg);
+    const json = $("promptCacheJSON");
+    if (json) json.value = prettyJSON(cfg);
+    renderPromptCacheRoutes(cfg);
+    renderPromptCacheProfiles(cfg);
+    updatePromptCacheStatus(cfg);
+  }
+
+  function renderPromptCacheRoutes(cfg) {
+    const host = $("pcRoutesList");
+    if (!host) return;
+    host.replaceChildren();
+    const routes = Object.entries(cfg.routes || {});
+    if (routes.length === 0) {
+      host.appendChild(el("div", { class: "cards-empty muted" }, "暂无路径映射"));
+      return;
+    }
+    for (const [path, profile] of routes) {
+      host.appendChild(buildPromptCacheRouteRow(path, profile));
+    }
+  }
+
+  function buildPromptCacheRouteRow(path, profile) {
+    return el("div", { class: "pc-route-row" },
+      inputNode("pc-route-path", path, { placeholder: "/api/cc 或 /v1/messages" }),
+      inputNode("pc-route-profile", profile, { placeholder: "profile 名称" }),
+      el("button", {
+        class: "btn tiny",
+        type: "button",
+        onclick: ev => {
+          ev.currentTarget.closest(".pc-route-row")?.remove();
+          promptCacheDirty = true;
+          refreshPromptCacheFormStatus();
+        },
+      }, "删除"),
+    );
+  }
+
+  function renderPromptCacheProfiles(cfg) {
+    const host = $("pcProfilesList");
+    if (!host) return;
+    host.replaceChildren();
+    const profiles = Object.entries(cfg.profiles || {});
+    if (profiles.length === 0) {
+      host.appendChild(el("div", { class: "cards-empty muted" }, "暂无 profile"));
+      return;
+    }
+    for (const [name, profile] of profiles) {
+      host.appendChild(buildPromptCacheProfileCard(name, profile));
+    }
+  }
+
+  function buildPromptCacheProfileCard(name, profile) {
+    profile = profile || {};
+    const card = el("div", { class: "pc-profile-card", "data-original-name": name },
+      el("div", { class: "pc-profile-head" },
+        inputNode("pc-profile-name", name, { placeholder: "profile 名称" }),
+        el("label", { class: "check-row compact" },
+          checkboxNode("pc-profile-enabled", profile.enabled),
+          el("span", {}, "启用"),
+        ),
+        el("button", {
+          class: "btn tiny",
+          type: "button",
+          onclick: ev => {
+            ev.currentTarget.closest(".pc-profile-card")?.remove();
+            promptCacheDirty = true;
+            refreshPromptCacheFormStatus();
+          },
+        }, "删除"),
+      ),
+      el("div", { class: "pc-profile-options" },
+        el("label", { class: "check-row compact" },
+          checkboxNode("pc-profile-simulate", profile.simulate_cache),
+          el("span", {}, "模拟缓存"),
+        ),
+        el("label", { class: "check-row compact" },
+          checkboxNode("pc-profile-stable", profile.synthesize_stable_prefix),
+          el("span", {}, "合成稳定前缀"),
+        ),
+        el("label", { class: "check-row compact" },
+          checkboxNode("pc-profile-ttl", profile.emit_cache_ttl_fields),
+          el("span", {}, "输出 5m/1h 字段"),
+        ),
+      ),
+      el("div", { class: "pc-profile-grid" },
+        labeledNumber("目标读缓存比例", "pc-profile-ratio", profile.target_read_ratio, { min: "0", max: "0.99", step: "0.01", placeholder: "如 0.95" }),
+        labeledNumber("token 放大倍率", "pc-profile-scale", profile.token_scale, { min: "1", max: "3", step: "0.1", placeholder: "默认 1" }),
+        labeledNumber("模拟输入封顶", "pc-profile-max-input", profile.max_simulated_input_tokens, { min: "0", step: "1000" }),
+        labeledNumber("封顶抖动下限", "pc-profile-jitter-min", profile.cap_jitter_min_tokens, { min: "0", step: "100" }),
+        labeledNumber("封顶抖动上限", "pc-profile-jitter-max", profile.cap_jitter_max_tokens, { min: "0", step: "100" }),
+        labeledNumber("放大起始输入", "pc-profile-scale-min", profile.scale_min_input_tokens, { min: "0", step: "100" }),
+      ),
+      el("div", { class: "pc-field-list" },
+        buildFieldPolicyRow("input", profile.input || {}, true),
+        buildFieldPolicyRow("output", profile.output || {}, false),
+        buildFieldPolicyRow("cache_read", profile.cache_read || {}, false),
+        buildFieldPolicyRow("cache_creation", profile.cache_creation || {}, false),
+      ),
+    );
+    return card;
+  }
+
+  function checkboxNode(className, checked) {
+    const n = el("input", { class: className, type: "checkbox" });
+    n.checked = !!checked;
+    return n;
+  }
+
+  function labeledNumber(label, className, value, attrs) {
+    return el("label", { class: "pc-number-field" },
+      el("span", {}, label),
+      numberNode(className, value, attrs),
+    );
+  }
+
+  function buildFieldPolicyRow(field, policy, allowMoveDelta) {
+    policy = policy || {};
+    const mode = policy.mode || "preserve";
+    const row = el("div", { class: "pc-field-row", "data-field": field },
+      el("span", { class: "pc-field-label" }, PC_FIELD_LABELS[field] || field),
+      selectNode("pc-field-mode", mode, PC_FIELD_MODES),
+      numberNode("pc-field-max", policy.max_tokens, { min: "0", step: "1", placeholder: "max" }),
+      numberNode("pc-field-target", policy.target_tokens, { min: "0", step: "1", placeholder: "target" }),
+      numberNode("pc-field-multiplier", policy.normal_max_multiplier, { min: "1", step: "0.05", placeholder: "mult" }),
+    );
+    if (allowMoveDelta) {
+      row.appendChild(el("label", { class: "check-row compact" },
+        checkboxNode("pc-field-move", policy.move_delta_to_cache_read),
+        el("span", {}, "差值转缓存读取"),
+      ));
+    }
+    return row;
+  }
+
+  function updatePromptCacheStatus(cfg) {
+    const status = $("promptCacheFormStatus");
+    if (!status) return;
+    const routeCount = Object.keys((cfg && cfg.routes) || {}).length;
+    const profileCount = Object.keys((cfg && cfg.profiles) || {}).length;
+    status.textContent = `${routeCount} 条路径 · ${profileCount} 个 profile${promptCacheDirty ? " · 未保存" : ""}`;
+  }
+
+  function refreshPromptCacheFormStatus() {
+    const status = $("promptCacheFormStatus");
+    if (!status) return;
+    const routeCount = document.querySelectorAll("#pcRoutesList .pc-route-row").length;
+    const profileCount = document.querySelectorAll("#pcProfilesList .pc-profile-card").length;
+    status.textContent = `${routeCount} 条路径 · ${profileCount} 个 profile${promptCacheDirty ? " · 未保存" : ""}`;
+  }
+
+  function markPromptCacheDirty() {
+    promptCacheDirty = true;
+    refreshPromptCacheFormStatus();
+  }
+
+  function collectPromptCacheConfigFromForm() {
+    const base = normalizePromptCacheConfig(promptCacheDraft);
+    const next = cloneJSON(base);
+    next.routes = {};
+    next.profiles = {};
+
+    document.querySelectorAll("#pcRoutesList .pc-route-row").forEach(row => {
+      const path = row.querySelector(".pc-route-path")?.value.trim();
+      const profile = row.querySelector(".pc-route-profile")?.value.trim();
+      if (!path && !profile) return;
+      if (!path || !profile) throw new Error("路径映射必须同时填写路径和 profile");
+      next.routes[path] = profile;
+    });
+
+    document.querySelectorAll("#pcProfilesList .pc-profile-card").forEach(card => {
+      const name = card.querySelector(".pc-profile-name")?.value.trim();
+      if (!name) throw new Error("profile 名称不能为空");
+      const original = card.dataset.originalName || name;
+      const profile = Object.assign({}, base.profiles[original] || base.profiles[name] || {});
+      profile.enabled = !!card.querySelector(".pc-profile-enabled")?.checked;
+      profile.simulate_cache = !!card.querySelector(".pc-profile-simulate")?.checked;
+      profile.synthesize_stable_prefix = !!card.querySelector(".pc-profile-stable")?.checked;
+      profile.emit_cache_ttl_fields = !!card.querySelector(".pc-profile-ttl")?.checked;
+      setOptionalNumber(profile, "target_read_ratio", card.querySelector(".pc-profile-ratio")?.value);
+      setOptionalNumber(profile, "token_scale", card.querySelector(".pc-profile-scale")?.value);
+      setOptionalNumber(profile, "max_simulated_input_tokens", card.querySelector(".pc-profile-max-input")?.value);
+      setOptionalNumber(profile, "cap_jitter_min_tokens", card.querySelector(".pc-profile-jitter-min")?.value);
+      setOptionalNumber(profile, "cap_jitter_max_tokens", card.querySelector(".pc-profile-jitter-max")?.value);
+      setOptionalNumber(profile, "scale_min_input_tokens", card.querySelector(".pc-profile-scale-min")?.value);
+      for (const field of Object.keys(PC_FIELD_LABELS)) {
+        profile[field] = collectFieldPolicy(card, field);
+      }
+      next.profiles[name] = profile;
+    });
+
+    if (next.default_profile && !next.profiles[next.default_profile]) {
+      delete next.default_profile;
+    }
+    return next;
+  }
+
+  function setOptionalNumber(obj, key, raw) {
+    const s = String(raw == null ? "" : raw).trim();
+    if (s === "") {
+      delete obj[key];
+      return;
+    }
+    const n = Number(s);
+    if (!Number.isFinite(n)) throw new Error(`${key} 必须是数字`);
+    obj[key] = n;
+  }
+
+  function collectFieldPolicy(card, field) {
+    const row = card.querySelector(`.pc-field-row[data-field="${field}"]`);
+    const policy = {};
+    if (!row) return policy;
+    policy.mode = row.querySelector(".pc-field-mode")?.value || "preserve";
+    setOptionalNumber(policy, "max_tokens", row.querySelector(".pc-field-max")?.value);
+    setOptionalNumber(policy, "target_tokens", row.querySelector(".pc-field-target")?.value);
+    setOptionalNumber(policy, "normal_max_multiplier", row.querySelector(".pc-field-multiplier")?.value);
+    const move = row.querySelector(".pc-field-move");
+    if (move) policy.move_delta_to_cache_read = !!move.checked;
+    return policy;
+  }
+
+  function promptCacheConfigFromJSONEditor() {
+    const raw = $("promptCacheJSON")?.value.trim() || "{}";
+    const cfg = JSON.parse(raw);
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) {
+      throw new Error("prompt_cache_reports 必须是 JSON object");
+    }
+    return normalizePromptCacheConfig(cfg);
+  }
+
+  function setPromptCacheJSONFromForm() {
+    const cfg = collectPromptCacheConfigFromForm();
+    const json = $("promptCacheJSON");
+    if (json) json.value = prettyJSON(cfg);
+    updatePromptCacheStatus(cfg);
+    return cfg;
+  }
+
+  async function savePromptCacheConfig(cfg, btn) {
+    const oldLabel = btn ? btn.textContent : "";
+    if (btn) { btn.disabled = true; btn.textContent = "保存中…"; }
+    try {
+      const previousServer = settingsCur && settingsCur.server;
+      const r = await apiFetch("/admin/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt_cache_reports: cfg }),
+      });
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new Error(`${r.status} ${r.statusText}${text ? ": " + text : ""}`);
+      }
+      settingsCur = await r.json();
+      if (previousServer && !settingsCur.server) settingsCur.server = previousServer;
+      promptCacheDirty = false;
+      renderPromptCacheConfig(settingsCur.prompt_cache_reports || {});
+      toast("缓存上报配置已保存", "success");
+    } catch (e) {
+      toast("保存失败：" + e.message, "error");
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = oldLabel || "保存"; }
+    }
+  }
+
+  function promptCacheProxyBaseURL() {
+    const sv = (settingsCur && settingsCur.server) || {};
+    return (sv.proxy_base_url && String(sv.proxy_base_url).replace(/\/$/, ""))
+      || `${location.protocol}//${location.host}`;
+  }
+
+  function addPromptCacheRoute(path, profile) {
+    const host = $("pcRoutesList");
+    if (!host) return;
+    host.querySelector(".cards-empty")?.remove();
+    host.appendChild(buildPromptCacheRouteRow(path, profile));
+    promptCacheDirty = true;
+    refreshPromptCacheFormStatus();
+  }
+
+  function addPromptCacheProfile(name, profile) {
+    const host = $("pcProfilesList");
+    if (!host) return;
+    host.querySelector(".cards-empty")?.remove();
+    host.appendChild(buildPromptCacheProfileCard(name, profile || {
+      enabled: true,
+      simulate_cache: true,
+      input: { mode: "preserve" },
+      output: { mode: "preserve" },
+      cache_read: { mode: "preserve" },
+      cache_creation: { mode: "preserve" },
+    }));
+    promptCacheDirty = true;
+    refreshPromptCacheFormStatus();
+  }
+
+  function nextPromptCacheProfileName() {
+    const used = new Set();
+    document.querySelectorAll("#pcProfilesList .pc-profile-name").forEach(input => {
+      if (input.value.trim()) used.add(input.value.trim());
+    });
+    for (let i = 1; i < 1000; i++) {
+      const candidate = "cache" + i;
+      if (!used.has(candidate)) return candidate;
+    }
+    return "cache";
+  }
+
+  function bindPromptCacheSettings() {
+    document.querySelector(".settings-card[data-section=\"prompt-cache\"]")?.addEventListener("input", markPromptCacheDirty);
+    document.querySelector(".settings-card[data-section=\"prompt-cache\"]")?.addEventListener("change", markPromptCacheDirty);
+    $("btnPCPresetBasic")?.addEventListener("click", () => {
+      renderPromptCacheConfig(promptCachePresetConfig());
+      promptCacheDirty = true;
+      refreshPromptCacheFormStatus();
+      toast("已载入预设，保存后生效", "success");
+    });
+    $("btnPCPresetEmpty")?.addEventListener("click", () => {
+      renderPromptCacheConfig({});
+      promptCacheDirty = true;
+      refreshPromptCacheFormStatus();
+      toast("已清空编辑区，保存后生效", "success");
+    });
+    $("btnPCCopyCurl")?.addEventListener("click", () => {
+      const base = promptCacheProxyBaseURL();
+      copyToClipboard([
+        `curl ${base}/v1/models`,
+        `curl ${base}/api/cc/v1/models`,
+        `curl ${base}/api/cc/v1/messages/count_tokens \\`,
+        `  -H 'Content-Type: application/json' \\`,
+        `  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}'`,
+        `curl ${base}/api/cc/v1/messages \\`,
+        `  -H 'Content-Type: application/json' \\`,
+        `  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}],"stream":false}'`,
+      ].join("\n"), "已复制 curl 示例");
+    });
+    $("btnPCSyncJSON")?.addEventListener("click", () => {
+      try {
+        setPromptCacheJSONFromForm();
+        promptCacheDirty = true;
+        refreshPromptCacheFormStatus();
+        toast("已同步到 JSON", "success");
+      } catch (e) {
+        toast("同步失败：" + e.message, "error");
+      }
+    });
+    $("btnPCRouteAdd")?.addEventListener("click", () => {
+      const name = nextPromptCacheProfileName();
+      addPromptCacheRoute("/api/" + name, name);
+    });
+    $("btnPCProfileAdd")?.addEventListener("click", () => {
+      addPromptCacheProfile(nextPromptCacheProfileName());
+    });
+    $("btnPCSaveForm")?.addEventListener("click", ev => {
+      try {
+        const cfg = setPromptCacheJSONFromForm();
+        savePromptCacheConfig(cfg, ev.currentTarget);
+      } catch (e) {
+        toast("保存失败：" + e.message, "error");
+      }
+    });
+    $("btnPCApplyJSON")?.addEventListener("click", () => {
+      try {
+        renderPromptCacheConfig(promptCacheConfigFromJSONEditor());
+        promptCacheDirty = true;
+        refreshPromptCacheFormStatus();
+        toast("JSON 已应用到界面", "success");
+      } catch (e) {
+        toast("JSON 解析失败：" + e.message, "error");
+      }
+    });
+    $("btnPCSaveJSON")?.addEventListener("click", ev => {
+      try {
+        const cfg = promptCacheConfigFromJSONEditor();
+        savePromptCacheConfig(cfg, ev.currentTarget);
+      } catch (e) {
+        toast("保存失败：" + e.message, "error");
+      }
+    });
+    $("btnPCCopyJSON")?.addEventListener("click", () => {
+      copyToClipboard($("promptCacheJSON")?.value || "", "已复制 JSON");
+    });
+  }
+
   async function loadSettings() {
     try {
       const s = await getJSON("/admin/settings");
       settingsCur = s;
+      if (!promptCacheDirty) {
+        renderPromptCacheConfig(s.prompt_cache_reports || {});
+      }
       // §1 server runtime (readonly) - everything wired from /admin/settings.server
       const sv = s.server || {};
       const setText = (id, v) => { const e = $(id); if (e) e.textContent = v || "—"; };
@@ -1520,8 +1972,9 @@
       setText("srvAdminAddr",   sv.admin_host && sv.admin_port ? `${sv.admin_host}:${sv.admin_port}` : "—");
       setText("srvTLSEnabled",  sv.tls_enabled ? "✓ 已启用 HTTPS" : "未启用（明文 HTTP）");
       setText("srvPublicURL",   sv.public_base_url || "（未设置）");
-      setText("srvCredsPath",   sv.creds_path || "（单账号模式 / SQLite）");
-      setText("srvPoolMode",    sv.multi_account ? "多账号 JSON 池" : "单账号 (SQLite)");
+      setText("srvAccountStore", sv.account_store || "postgresql");
+      setText("srvRuntimeStore", sv.runtime_store || "redis");
+      setText("srvPoolMode",    sv.multi_account ? "多账号 PostgreSQL 池" : "账号存储未配置");
       const geo = sv.geoip || {};
       if (geo.loaded) {
         const buildAge = geo.build_epoch ? fmtRelative(geo.build_epoch * 1000) : "—";
@@ -1642,6 +2095,7 @@
     if (!body) return;
     if (btn) { btn.disabled = true; btn.textContent = "保存中…"; }
     try {
+      const previousServer = settingsCur && settingsCur.server;
       const r = await apiFetch("/admin/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -1652,6 +2106,7 @@
         throw new Error(`${r.status} ${r.statusText}${text ? ": " + text : ""}`);
       }
       settingsCur = await r.json();
+      if (previousServer && !settingsCur.server) settingsCur.server = previousServer;
       toast("已保存", "success");
     } catch (e) {
       toast("保存失败：" + e.message, "error");
@@ -2084,7 +2539,6 @@
     switchAddTab("oauth");
     resetOAuthBlock();
     $("addTokenPayload").value = "";
-    $("localKiroRow").style.display = providerID === "kiro" ? "" : "none";
     openDialog("addProviderDialog");
   }
 
@@ -2199,57 +2653,25 @@
   async function submitTokenPayload() {
     const raw = ($("addTokenPayload").value || "").trim();
     if (!raw) { toast("请粘贴内容", "error"); return; }
-    let parsed;
-    try { parsed = JSON.parse(raw); }
-    catch (e) { toast("仅支持 JSON 格式（数组或单条对象）", "error"); return; }
     try {
-      let r;
-      if (Array.isArray(parsed)) {
-        r = await apiFetch("/admin/accounts/import", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ accounts: parsed, mode: "append" }),
-        });
-      } else if (parsed.accounts && Array.isArray(parsed.accounts)) {
-        r = await apiFetch("/admin/accounts/import", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(parsed),
-        });
-      } else {
-        if (!parsed.provider) parsed.provider = addProviderID;
-        r = await apiFetch("/admin/accounts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(parsed),
-        });
-      }
+      const r = await apiFetch("/admin/accounts/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: raw,
+      });
       const text = await r.text();
       if (!r.ok) throw new Error(text);
-      toast("导入完成", "success");
+      let result = {};
+      try { result = JSON.parse(text); } catch (_) {}
+      const parts = [];
+      if (result.added != null) parts.push(`新增 ${result.added}`);
+      if (result.skipped) parts.push(`跳过 ${result.skipped}`);
+      if (result.errors?.length) parts.push(`错误 ${result.errors.length}`);
+      toast("导入完成" + (parts.length ? "：" + parts.join(" · ") : ""), result.errors?.length ? "error" : "success");
       loadAccounts(); loadHealth();
       closeDialog("addProviderDialog");
     } catch (e) {
       toast("导入失败：" + e.message, "error");
-    }
-  }
-
-  async function localKiroImport() {
-    if (!confirm("从本机 Kiro CLI 数据库读取当前登录的账号并添加到池？")) return;
-    try {
-      const r = await apiFetch("/admin/import/local-kiro", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      const text = await r.text();
-      if (!r.ok) throw new Error(text);
-      const data = JSON.parse(text);
-      toast("已导入：" + data.id + " · " + (data.region || "—"), "success");
-      loadAccounts(); loadHealth();
-      closeDialog("addProviderDialog");
-    } catch (e) {
-      toast("本机导入失败：" + e.message, "error");
     }
   }
 
@@ -2316,17 +2738,11 @@
         toast("请先粘贴 JSON 或选择文件", "error");
         return;
       }
-      let parsed;
-      try { parsed = JSON.parse(raw); }
-      catch (e) { toast("JSON 解析失败：" + e.message, "error"); return; }
-      const body = Array.isArray(parsed)
-        ? { accounts: parsed, mode }
-        : Object.assign({}, parsed, { mode: parsed.mode || mode });
       try {
-        const r = await apiFetch("/admin/accounts/import", {
+        const r = await apiFetch("/admin/accounts/import?mode=" + encodeURIComponent(mode), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: raw,
         });
         const result = await r.json();
         if (!r.ok) throw new Error(result?.error || `${r.status} ${r.statusText}`);
@@ -2363,8 +2779,12 @@
     $("recentStatus")?.addEventListener("change", loadRecent);
     $("recentModel")?.addEventListener("change", loadRecent);
     $("recentKey")?.addEventListener("change", loadRecent);
+    $("recentCred")?.addEventListener("change", loadRecent);
     $("btnExportCSV")?.addEventListener("click", exportRecentCSV);
     $("btnExportJSON")?.addEventListener("click", exportRecentJSON);
+    $("btnCopyErrorDetail")?.addEventListener("click", () => {
+      copyToClipboard($("errorDetailText")?.textContent || "", "已复制错误详情");
+    });
     $("recentPageSize")?.addEventListener("change", (ev) => {
       recentChangePageSize(parseInt(ev.target.value, 10) || 50);
     });
@@ -2404,8 +2824,6 @@
     });
     $("btnImportAccount")?.addEventListener("click", () => openDialog("importAccountDialog"));
     $("btnRefreshAllQuota")?.addEventListener("click", onRefreshAllQuota);
-    bindCredsFilePage();
-
     // Modal dialogs: close buttons + backdrop close.
     document.querySelectorAll("[data-close-dialog]").forEach(b => {
       b.addEventListener("click", () => closeDialog(b.dataset.closeDialog));
@@ -2446,7 +2864,6 @@
 
     // Token tab + Local tab actions
     $("btnSubmitTokenPayload")?.addEventListener("click", submitTokenPayload);
-    $("btnLocalKiroImport")?.addEventListener("click", localKiroImport);
     $("btnLocalFilePick")?.addEventListener("click", () => $("localFilePicker").click());
     $("localFilePicker")?.addEventListener("change", onLocalFileChosen);
 
@@ -2456,6 +2873,7 @@
     document.querySelectorAll("[data-save]").forEach(b => {
       b.addEventListener("click", () => saveSettings(b.dataset.save, b));
     });
+    bindPromptCacheSettings();
     $("btnAddAPIKey")?.addEventListener("click", openAddAPIKeyDialog);
     $("addAPIKeyForm")?.addEventListener("submit", submitAddAPIKey);
     $("btnCopyRevealKey")?.addEventListener("click", copyRevealKey);

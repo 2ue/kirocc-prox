@@ -3,6 +3,7 @@ package messages
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/niuma/kirocc-pro/internal/httpx"
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
 	"github.com/niuma/kirocc-pro/internal/logging"
+	"github.com/niuma/kirocc-pro/internal/promptcache"
 	"github.com/niuma/kirocc-pro/internal/reqconv"
 	"github.com/niuma/kirocc-pro/internal/respconv"
 )
@@ -26,9 +28,10 @@ type thinkingToolOrchestrator struct {
 	buildOpts         reqconv.BuildOptions
 	contextWindowSize int
 	responseModel     string
+	inv               *invocation
 }
 
-func (s *Service) runThinkingTool(ctx context.Context, w http.ResponseWriter, req *anthropic.Request, creds *auth.Credentials, kiroModel, responseModel string, contextWindowSize int, thinkingBudget int, ccSessionID, short string) {
+func (s *Service) runThinkingTool(ctx context.Context, w http.ResponseWriter, req *anthropic.Request, creds *auth.Credentials, credID, kiroModel, responseModel string, contextWindowSize int, thinkingBudget int, ccSessionID, short string, reportProfile *promptcache.MatchedProfile) retryOutcome {
 	orch := &thinkingToolOrchestrator{
 		service: s,
 		req:     req,
@@ -43,34 +46,58 @@ func (s *Service) runThinkingTool(ctx context.Context, w http.ResponseWriter, re
 		},
 		contextWindowSize: contextWindowSize,
 		responseModel:     responseModel,
+		inv: &invocation{
+			req:               req,
+			creds:             creds,
+			credID:            credID,
+			conversationID:    ccSessionID,
+			model:             kiroModel,
+			responseModel:     responseModel,
+			contextWindowSize: contextWindowSize,
+			thinking:          true,
+			thinkingBudget:    thinkingBudget,
+			tools:             req.Tools,
+			reportProfile:     reportProfile,
+		},
 	}
-	reason := orch.run(ctx, w)
-	if reason != retryReasonEmptyVisibleEndTurn {
-		return
+	out := orch.run(ctx, w)
+	if out.Reason != retryReasonEmptyVisibleEndTurn {
+		return out
 	}
 	slog.WarnContext(ctx, "retrying thinking tool after empty visible end_turn", "trace_id", short)
-	if r2 := orch.run(ctx, w); r2 == retryReasonEmptyVisibleEndTurn {
+	out2 := orch.run(ctx, w)
+	out2.RetryCount = 1
+	if out2.Reason == retryReasonEmptyVisibleEndTurn {
 		slog.ErrorContext(ctx, "thinking tool retry also returned empty visible end_turn", "trace_id", short)
 		httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream returned empty response")
+		out2.Reason = ""
+		out2.TerminalErr = errors.New("upstream returned empty response")
 	}
+	return out2
 }
 
-func (o *thinkingToolOrchestrator) run(ctx context.Context, w http.ResponseWriter) string {
+func (o *thinkingToolOrchestrator) run(ctx context.Context, w http.ResponseWriter) retryOutcome {
 	if o.req.Stream {
 		return o.handleStreaming(ctx, w)
 	}
 	return o.handleNonStreaming(ctx, w)
 }
 
-func (o *thinkingToolOrchestrator) handleStreaming(ctx context.Context, w http.ResponseWriter) string {
+func (o *thinkingToolOrchestrator) handleStreaming(ctx context.Context, w http.ResponseWriter) retryOutcome {
 	_, short := logging.TraceIDs(ctx)
 
 	gw := NewGateWriter(w)
 	sw := respconv.NewSSEWriter(ctx, gw, o.responseModel, o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, 0)
-	sw.OnVisibleOutput = func() { gw.Promote() }
+	sw.OnVisibleOutput = func() {
+		markMetricsFirstToken(w)
+		gw.Promote()
+	}
 
 	msgs := slices.Clone(o.req.Messages)
 	var cumulativeInputTokens, cumulativeOutputTokens int
+	var cumulativeRawInputTokens, cumulativeRawOutputTokens int
+	var cumulativeRawCacheReadTokens, cumulativeRawCacheWriteTokens int
+	var lastCacheAttempt *promptCacheAttempt
 	// [fork] Added in fork (fix #5/#6): invalidToolRetried gates the one-shot
 	// invalid-tool reflow inside the thinking-tool round loop. Mirrors the
 	// same pattern in toolsearch.go and the non-streaming branch below.
@@ -81,7 +108,7 @@ func (o *thinkingToolOrchestrator) handleStreaming(ctx context.Context, w http.R
 		if err != nil {
 			slog.WarnContext(ctx, "thinking tool payload build error", "trace_id", short, "err", err)
 			writeStreamingOrJSONError(gw, sw, w, http.StatusBadRequest, errTypeInvalidRequest, err.Error())
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 		sw.SetToolNameMap(nameMap.ReverseMap())
 		sw.SetToolInputValidator(respconv.NewToolInputValidator(o.req.Tools))
@@ -90,15 +117,23 @@ func (o *thinkingToolOrchestrator) handleStreaming(ctx context.Context, w http.R
 		if err != nil {
 			logUpstreamError(ctx, short, err, "round", round+1)
 			writeStreamingOrJSONError(gw, sw, w, http.StatusBadGateway, errTypeAPI, "upstream API error")
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 
 		if round > 0 {
 			in, out := sw.Usage()
+			rawIn, rawOut := sw.RawUsage()
 			cumulativeInputTokens += in
 			cumulativeOutputTokens += out
-			sw.ResetAccumulator(o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, 0)
+			cumulativeRawInputTokens += rawIn
+			cumulativeRawOutputTokens += rawOut
+			cumulativeRawCacheReadTokens += sw.RawCacheReadInputTokens()
+			cumulativeRawCacheWriteTokens += sw.RawCacheWriteInputTokens()
 		}
+		sw.ResetAccumulator(o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, apiResp.PromptTokens)
+		cacheAttempt := o.service.promptCacheAttempt(o.inv, apiResp.PromptTokens)
+		lastCacheAttempt = cacheAttempt
+		sw.SetUsageAdjuster(cacheAttempt.usageAdjuster())
 
 		var foundThinking bool
 		var thinkingToolUseID, thinkingToolInput string
@@ -138,7 +173,7 @@ func (o *thinkingToolOrchestrator) handleStreaming(ctx context.Context, w http.R
 		if err != nil && !foundThinking {
 			slog.ErrorContext(ctx, "stream error", "trace_id", short, "round", round+1, "err", err)
 			writeStreamingOrJSONError(gw, sw, w, http.StatusBadGateway, errTypeAPI, "upstream stream error")
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 
 		if foundThinking {
@@ -157,7 +192,7 @@ func (o *thinkingToolOrchestrator) handleStreaming(ctx context.Context, w http.R
 					"invalid_tool_calls", len(calls),
 				)
 				writeInvalidToolUseFallback(ctx, w, o.responseModel, true, calls)
-				return ""
+				return retryOutcome{TerminalErr: errors.New("invalid_tool_use_persistent")}
 			}
 			gw.Discard()
 			slog.WarnContext(ctx, "retrying thinking tool after invalid tool_use",
@@ -178,7 +213,7 @@ func (o *thinkingToolOrchestrator) handleStreaming(ctx context.Context, w http.R
 		if !streamErr && !localStop && sw.IsEmptyVisibleEndTurn() && !gw.IsPromoted() {
 			gw.Discard()
 			slog.WarnContext(ctx, "empty visible end_turn detected in thinking tool", "trace_id", short)
-			return retryReasonEmptyVisibleEndTurn
+			return retryOutcome{Reason: retryReasonEmptyVisibleEndTurn}
 		}
 		if streamErr && !gw.IsPromoted() {
 			gw.Discard()
@@ -186,25 +221,62 @@ func (o *thinkingToolOrchestrator) handleStreaming(ctx context.Context, w http.R
 		}
 		if !streamErr {
 			inputTokens, outputTokens := sw.Usage()
+			rawInputTokens, rawOutputTokens := sw.RawUsage()
 			logResponseStats(ctx, short, inputTokens+cumulativeInputTokens, outputTokens+cumulativeOutputTokens, sw.HasContextUsage(), sw.ContextUsagePercentage(), o.contextWindowSize)
+			if mw, ok := w.(*metricsResponseWriter); ok {
+				pct := resolveContextPercent(sw.ContextUsagePercentage(), sw.HasContextUsage(), inputTokens+cumulativeInputTokens, o.contextWindowSize)
+				mw.setUsageDetailed(
+					inputTokens+cumulativeInputTokens,
+					outputTokens+cumulativeOutputTokens,
+					sw.FinalCacheReadInputTokens(),
+					sw.FinalCacheWriteInputTokens(),
+					rawInputTokens+cumulativeRawInputTokens,
+					rawOutputTokens+cumulativeRawOutputTokens,
+					sw.RawCacheReadInputTokens()+cumulativeRawCacheReadTokens,
+					sw.RawCacheWriteInputTokens()+cumulativeRawCacheWriteTokens,
+					pct,
+				)
+			}
+			cacheAttempt.commitIfApplied()
+			return retryOutcome{}
 		}
-		return ""
+		return retryOutcome{TerminalErr: errors.New("upstream stream error")}
 	}
 
 	slog.WarnContext(ctx, "thinking tool max rounds reached", "trace_id", short, "max_rounds", maxThinkingToolRounds)
 	if !gw.IsPromoted() {
 		gw.Discard()
-		return retryReasonEmptyVisibleEndTurn
+		return retryOutcome{Reason: retryReasonEmptyVisibleEndTurn}
 	}
 	sw.Finish()
-	return ""
+	inputTokens, outputTokens := sw.Usage()
+	rawInputTokens, rawOutputTokens := sw.RawUsage()
+	if mw, ok := w.(*metricsResponseWriter); ok {
+		pct := resolveContextPercent(sw.ContextUsagePercentage(), sw.HasContextUsage(), inputTokens+cumulativeInputTokens, o.contextWindowSize)
+		mw.setUsageDetailed(
+			inputTokens+cumulativeInputTokens,
+			outputTokens+cumulativeOutputTokens,
+			sw.FinalCacheReadInputTokens(),
+			sw.FinalCacheWriteInputTokens(),
+			rawInputTokens+cumulativeRawInputTokens,
+			rawOutputTokens+cumulativeRawOutputTokens,
+			sw.RawCacheReadInputTokens()+cumulativeRawCacheReadTokens,
+			sw.RawCacheWriteInputTokens()+cumulativeRawCacheWriteTokens,
+			pct,
+		)
+	}
+	lastCacheAttempt.commitIfApplied()
+	return retryOutcome{}
 }
 
-func (o *thinkingToolOrchestrator) handleNonStreaming(ctx context.Context, w http.ResponseWriter) string {
+func (o *thinkingToolOrchestrator) handleNonStreaming(ctx context.Context, w http.ResponseWriter) retryOutcome {
 	_, short := logging.TraceIDs(ctx)
 	msgs := slices.Clone(o.req.Messages)
 
 	var totalInputTokens, totalOutputTokens int
+	var totalCacheReadTokens, totalCacheWriteTokens int
+	var totalRawInputTokens, totalRawOutputTokens int
+	var totalRawCacheReadTokens, totalRawCacheWriteTokens int
 	var finalResp map[string]any
 	var finalStats respconv.NonStreamingStats
 	var invalidToolRetried bool
@@ -213,16 +285,16 @@ func (o *thinkingToolOrchestrator) handleNonStreaming(ctx context.Context, w htt
 		payload, nameMap, err := o.buildPayload(msgs)
 		if err != nil {
 			httpx.WriteError(w, http.StatusBadRequest, errTypeInvalidRequest, err.Error())
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 		apiResp, err := o.service.client.GenerateAssistantResponse(ctx, o.creds.AccessToken, payload, o.creds.Region)
 		if err != nil {
 			logUpstreamError(ctx, short, err, "round", round+1)
 			httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream API error")
-			return ""
+			return retryOutcome{TerminalErr: err}
 		}
 
-		acc := respconv.NewNonStreamingAccumulator(o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, 0)
+		acc := respconv.NewNonStreamingAccumulator(o.contextWindowSize, o.req.StopSequences, o.req.MaxTokens, apiResp.PromptTokens)
 		acc.SetToolNameMap(nameMap.ReverseMap())
 		acc.SetToolInputValidator(respconv.NewToolInputValidator(o.req.Tools))
 
@@ -237,6 +309,7 @@ func (o *thinkingToolOrchestrator) handleNonStreaming(ctx context.Context, w htt
 				return true
 			}
 			d := acc.ProcessEvent(e)
+			markMetricsFirstTokenForDelta(w, d)
 			if d.IsError {
 				hasError = true
 				return true
@@ -247,7 +320,10 @@ func (o *thinkingToolOrchestrator) handleNonStreaming(ctx context.Context, w htt
 
 		if (err != nil || hasError) && !foundThinking {
 			httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream error")
-			return ""
+			if err != nil {
+				return retryOutcome{TerminalErr: err}
+			}
+			return retryOutcome{TerminalErr: errors.New("upstream error")}
 		}
 
 		if calls := acc.InvalidToolCalls(); len(calls) > 0 && !foundThinking {
@@ -258,7 +334,7 @@ func (o *thinkingToolOrchestrator) handleNonStreaming(ctx context.Context, w htt
 					"invalid_tool_calls", len(calls),
 				)
 				writeInvalidToolUseFallback(ctx, w, o.responseModel, false, calls)
-				return ""
+				return retryOutcome{TerminalErr: errors.New("invalid_tool_use_persistent")}
 			}
 			slog.WarnContext(ctx, "retrying thinking tool after invalid tool_use",
 				"trace_id", short,
@@ -272,9 +348,20 @@ func (o *thinkingToolOrchestrator) handleNonStreaming(ctx context.Context, w htt
 			continue
 		}
 
+		var cacheAttempt *promptCacheAttempt
+		if !foundThinking {
+			cacheAttempt = o.service.promptCacheAttempt(o.inv, apiResp.PromptTokens)
+			acc.SetUsageAdjuster(cacheAttempt.usageAdjuster())
+		}
 		resp, stats := acc.BuildResponse(o.responseModel)
 		totalInputTokens += stats.InputTokens
 		totalOutputTokens += stats.OutputTokens
+		totalCacheReadTokens += stats.CacheReadInputTokens
+		totalCacheWriteTokens += stats.CacheWriteInputTokens
+		totalRawInputTokens += stats.RawInputTokens
+		totalRawOutputTokens += stats.RawOutputTokens
+		totalRawCacheReadTokens += stats.RawCacheReadTokens
+		totalRawCacheWriteTokens += stats.RawCacheWriteTokens
 		finalResp = resp
 		finalStats = stats
 
@@ -287,27 +374,40 @@ func (o *thinkingToolOrchestrator) handleNonStreaming(ctx context.Context, w htt
 
 		if acc.IsEmptyVisibleEndTurn() {
 			slog.WarnContext(ctx, "empty visible end_turn detected in thinking tool", "trace_id", short)
-			return retryReasonEmptyVisibleEndTurn
+			return retryOutcome{Reason: retryReasonEmptyVisibleEndTurn}
 		}
+		cacheAttempt.commitIfApplied()
 		break
 	}
 
 	if finalResp == nil {
 		httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream returned empty response")
-		return ""
+		return retryOutcome{TerminalErr: errors.New("upstream returned empty response")}
 	}
 	if usage, ok := finalResp["usage"].(map[string]any); ok {
 		usage["input_tokens"] = totalInputTokens
 		usage["output_tokens"] = totalOutputTokens
+		usage["cache_read_input_tokens"] = totalCacheReadTokens
+		usage["cache_creation_input_tokens"] = totalCacheWriteTokens
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.MarshalWrite(w, finalResp); err != nil {
 		slog.ErrorContext(ctx, "write non-streaming response failed", "err", err)
-		return ""
+		return retryOutcome{TerminalErr: err}
 	}
 	_, _ = w.Write([]byte("\n"))
+	if content, ok := finalResp["content"].([]any); ok && len(content) > 0 {
+		markMetricsFirstToken(w)
+	}
 	logResponseStats(ctx, short, totalInputTokens, totalOutputTokens, finalStats.HasContextUsage, finalStats.ContextUsagePercentage, o.contextWindowSize)
-	return ""
+	if mw, ok := w.(*metricsResponseWriter); ok {
+		mw.setUsageDetailed(
+			totalInputTokens, totalOutputTokens, totalCacheReadTokens, totalCacheWriteTokens,
+			totalRawInputTokens, totalRawOutputTokens, totalRawCacheReadTokens, totalRawCacheWriteTokens,
+			resolveContextPercent(finalStats.ContextUsagePercentage, finalStats.HasContextUsage, totalInputTokens, o.contextWindowSize),
+		)
+	}
+	return retryOutcome{}
 }
 
 func (o *thinkingToolOrchestrator) buildPayload(msgs []anthropic.Message) (*kiroproto.Payload, *reqconv.ToolNameMap, error) {

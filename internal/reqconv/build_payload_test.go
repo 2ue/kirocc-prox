@@ -869,6 +869,58 @@ func TestBuildPayload_AssistantMessageID(t *testing.T) {
 	}
 }
 
+func TestBuildPayload_CacheControlDoesNotChangeUpstreamPayload(t *testing.T) {
+	req := &anthropic.Request{
+		Model: "claude-sonnet-4-6",
+		System: anthropic.SystemPrompt{Blocks: []anthropic.SystemBlock{{
+			Type:         anthropic.BlockTypeText,
+			Text:         "System A",
+			CacheControl: &anthropic.CacheControl{Type: "ephemeral"},
+		}}},
+		Tools: []anthropic.Tool{{
+			Name:         "get_weather",
+			Description:  "Get weather",
+			InputSchema:  map[string]any{"type": "object"},
+			CacheControl: &anthropic.CacheControl{Type: "ephemeral"},
+		}},
+		Messages: []anthropic.Message{
+			{Role: "user", Content: anthropic.MessageContent{Text: "Hello"}},
+			{Role: "assistant", Content: anthropic.MessageContent{Blocks: []anthropic.ContentBlock{{
+				Type:         anthropic.BlockTypeText,
+				Text:         "Hi",
+				CacheControl: &anthropic.CacheControl{Type: "ephemeral"},
+			}}}},
+			{Role: "user", Content: anthropic.MessageContent{Blocks: []anthropic.ContentBlock{{
+				Type:         anthropic.BlockTypeText,
+				Text:         "Current",
+				CacheControl: &anthropic.CacheControl{Type: "ephemeral"},
+			}}}},
+		},
+	}
+
+	payload, _, err := BuildPayload(req, BuildOptions{ModelID: "claude-sonnet-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := payload.ConversationState.History
+	if history[0].UserInputMessage.CachePoint != nil {
+		t.Fatal("system prompt cache_control must not add upstream cachePoint")
+	}
+	if history[3].AssistantResponseMessage.CachePoint != nil {
+		t.Fatal("assistant history cache_control must not add upstream cachePoint")
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if current.CachePoint != nil {
+		t.Fatal("current message cache_control must not add upstream cachePoint")
+	}
+	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.Tools) != 1 {
+		t.Fatalf("tools = %+v, want only the original tool spec", current.UserInputMessageContext)
+	}
+	if current.UserInputMessageContext.Tools[0].CachePoint != nil {
+		t.Fatal("tool cache_control must not append cachePoint entry")
+	}
+}
+
 func TestPlaceSystemPrompt_InjectsIntoHistory(t *testing.T) {
 	history := []kiroproto.HistoryEntry{
 		{UserInputMessage: &kiroproto.HistoryUserInputMessage{Content: "hello"}},

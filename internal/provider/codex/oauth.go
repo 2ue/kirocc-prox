@@ -167,11 +167,12 @@ func (p *Provider) CompleteOAuth(ctx context.Context, params url.Values, flow *p
 	}
 
 	cred := &pool.Credential{
-		ID:       id,
-		Label:    label,
-		Provider: ID,
-		Priority: 100,
-		Metadata: metadata,
+		ID:          id,
+		Label:       label,
+		Provider:    ID,
+		Priority:    100,
+		MaxInFlight: pool.DefaultMaxInFlight,
+		Metadata:    metadata,
 		Credentials: auth.Credentials{
 			AccessToken:  accessToken,
 			RefreshToken: refreshToken,

@@ -2,6 +2,7 @@ package messages
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/niuma/kirocc-pro/internal/httpx"
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
 	"github.com/niuma/kirocc-pro/internal/logging"
+	"github.com/niuma/kirocc-pro/internal/promptcache"
 )
 
 // invocation bundles everything callAndHandle needs for one upstream attempt.
@@ -18,6 +20,8 @@ type invocation struct {
 	req               *anthropic.Request
 	payload           *kiroproto.Payload
 	creds             *auth.Credentials
+	credID            string
+	conversationID    string
 	model             string
 	responseModel     string
 	contextWindowSize int
@@ -25,6 +29,7 @@ type invocation struct {
 	thinkingBudget    int
 	toolNameMap       map[string]string
 	tools             []anthropic.Tool
+	reportProfile     *promptcache.MatchedProfile
 }
 
 // [fork] Modified from upstream d-kuro/kirocc: added the retryInvalidToolUse
@@ -48,7 +53,7 @@ func (s *Service) callAndHandle(ctx context.Context, w http.ResponseWriter, inv 
 		// caller can record the real status (rate_limited / auth_error /
 		// upstream_error) in usage_records instead of silently labelling
 		// the request as "success".
-		return retryOutcome{TerminalErr: err.Error()}
+		return retryOutcome{TerminalErr: err}
 	}
 	body := apiResp.Body
 	defer func() { _ = body.Close() }()
@@ -57,13 +62,13 @@ func (s *Service) callAndHandle(ctx context.Context, w http.ResponseWriter, inv 
 	}
 
 	if inv.req.Stream {
-		out := s.handleStreamingResponse(ctx, w, apiResp, inv.responseModel, inv.contextWindowSize, inv.req.StopSequences, inv.req.MaxTokens, apiResp.PromptTokens, capture, inv.toolNameMap, inv.tools, retryInvalidToolUse)
+		out := s.handleStreamingResponse(ctx, w, apiResp, inv.responseModel, inv.contextWindowSize, inv.req.StopSequences, inv.req.MaxTokens, apiResp.PromptTokens, capture, inv.toolNameMap, inv.tools, s.promptCacheAttempt(inv, apiResp.PromptTokens), retryInvalidToolUse)
 		if out.Reason == retryReasonEmptyVisibleEndTurn {
 			capture.logCapture(ctx, out.Reason)
 		}
 		return out
 	} else {
-		out := s.handleNonStreamingResponse(ctx, w, apiResp, inv.responseModel, inv.contextWindowSize, inv.req.StopSequences, inv.req.MaxTokens, apiResp.PromptTokens, capture, inv.toolNameMap, inv.tools, retryInvalidToolUse)
+		out := s.handleNonStreamingResponse(ctx, w, apiResp, inv.responseModel, inv.contextWindowSize, inv.req.StopSequences, inv.req.MaxTokens, apiResp.PromptTokens, capture, inv.toolNameMap, inv.tools, s.promptCacheAttempt(inv, apiResp.PromptTokens), retryInvalidToolUse)
 		if out.Reason == retryReasonEmptyVisibleEndTurn {
 			capture.logCapture(ctx, out.Reason)
 		}
@@ -74,16 +79,16 @@ func (s *Service) callAndHandle(ctx context.Context, w http.ResponseWriter, inv 
 // executeWithRetry runs the invocation and handles retryable invalidStateEvent
 // responses by clearing ConversationID and attempting once more. Terminal error
 // responses are written to w and the function returns. Returns the number of
-// retries performed and the upstream error message (empty when the call
-// ultimately succeeded — letting the caller record the correct usage status).
-func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, inv *invocation) (int, string) {
+// retries performed and the terminal error (nil when the call ultimately
+// succeeded — letting the caller record the correct usage status).
+func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, inv *invocation) (int, error) {
 	_, short := logging.TraceIDs(ctx)
 
 	out := s.callAndHandle(ctx, w, inv, 1, true)
-	if out.Reason == "" && out.TerminalErr == "" {
-		return 0, ""
+	if out.Reason == "" && out.TerminalErr == nil {
+		return 0, nil
 	}
-	if out.TerminalErr != "" {
+	if out.TerminalErr != nil {
 		// Upstream call itself failed (HTTP layer). No retry — the error
 		// was already written to w by callAndHandle.
 		return 0, out.TerminalErr
@@ -101,19 +106,19 @@ func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, i
 		if err := prepareInvalidToolUseRetry(inv, out.InvalidToolCalls); err != nil {
 			slog.ErrorContext(ctx, "invalid tool retry preparation failed", "trace_id", short, "err", err)
 			httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "invalid tool retry preparation failed")
-			return 1, "invalid tool retry preparation failed"
+			return 1, errors.New("invalid tool retry preparation failed")
 		}
 		out2 := s.callAndHandle(ctx, w, inv, 2, false)
-		if out2.Reason == "" && out2.TerminalErr == "" {
-			return 1, ""
+		if out2.Reason == "" && out2.TerminalErr == nil {
+			return 1, nil
 		}
-		if out2.TerminalErr != "" {
+		if out2.TerminalErr != nil {
 			return 1, out2.TerminalErr
 		}
 		if out2.Reason == retryReasonEmptyVisibleEndTurn {
 			slog.ErrorContext(ctx, "invalid tool retry returned empty visible end_turn", "trace_id", short)
 			httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream returned empty response")
-			return 1, "upstream returned empty response"
+			return 1, errors.New("upstream returned empty response")
 		}
 		if out2.Reason == retryReasonInvalidToolUse {
 			slog.ErrorContext(ctx, "invalid tool retry still returned invalid tool_use",
@@ -121,11 +126,11 @@ func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, i
 				"invalid_tool_calls", len(out2.InvalidToolCalls),
 			)
 			writeInvalidToolUseFallback(ctx, w, inv.responseModel, inv.req.Stream, out2.InvalidToolCalls)
-			return 1, "invalid_tool_use_persistent"
+			return 1, errors.New("invalid_tool_use_persistent")
 		}
 		slog.ErrorContext(ctx, "invalid tool retry failed", "trace_id", short, "reason", out2.Reason)
 		httpx.WriteError(w, http.StatusBadRequest, errTypeInvalidRequest, "invalid state: "+out2.Reason)
-		return 1, "invalid state: " + out2.Reason
+		return 1, errors.New("invalid state: " + out2.Reason)
 	}
 
 	slog.WarnContext(ctx, "retrying upstream request",
@@ -137,21 +142,21 @@ func (s *Service) executeWithRetry(ctx context.Context, w http.ResponseWriter, i
 	inv.payload.ConversationState.ConversationID = ""
 
 	out2 := s.callAndHandle(ctx, w, inv, 2, true)
-	if out2.Reason == "" && out2.TerminalErr == "" {
-		return 1, ""
+	if out2.Reason == "" && out2.TerminalErr == nil {
+		return 1, nil
 	}
-	if out2.TerminalErr != "" {
+	if out2.TerminalErr != nil {
 		return 1, out2.TerminalErr
 	}
 	if out2.Reason == retryReasonEmptyVisibleEndTurn {
 		slog.ErrorContext(ctx, "retry also returned empty visible end_turn",
 			"trace_id", short, "reason", out2.Reason)
 		httpx.WriteError(w, http.StatusBadGateway, errTypeAPI, "upstream returned empty response")
-		return 1, "upstream returned empty response"
+		return 1, errors.New("upstream returned empty response")
 	}
 	// Retry ended with a different (final) error — report it as invalid state.
 	slog.ErrorContext(ctx, "retry failed",
 		"trace_id", short, "first_reason", out.Reason, "second_reason", out2.Reason)
 	httpx.WriteError(w, http.StatusBadRequest, errTypeInvalidRequest, "invalid state: "+out2.Reason)
-	return 1, "invalid state: " + out2.Reason
+	return 1, errors.New("invalid state: " + out2.Reason)
 }

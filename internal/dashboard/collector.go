@@ -18,6 +18,7 @@ type RequestRecord struct {
 	OutputTokens int       `json:"output_tokens"`
 	ContextPct   float64   `json:"context_pct"`
 	LatencyMs    int64     `json:"latency_ms"`
+	FirstTokenMs int64     `json:"first_token_ms"`
 	RetryCount   int       `json:"retry_count"`
 	Status       string    `json:"status"` // "ok" | "error" | "retry"
 	ErrorMsg     string    `json:"error_msg,omitempty"`

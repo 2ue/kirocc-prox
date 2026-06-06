@@ -11,6 +11,8 @@ import (
 	"github.com/niuma/kirocc-pro/internal/auth"
 )
 
+const DefaultMaxInFlight = 3
+
 // Credential is one Kiro account in the pool.
 //
 // The embedded auth.Credentials carries OAuth tokens and is refreshed in
@@ -29,18 +31,22 @@ type Credential struct {
 	Priority       int    // higher wins ties; default 100
 	Disabled       bool   // operator override; never selected
 	DisableCooling bool   // skip cooldown after rate limits (unlimited-tier keys)
+	MaxInFlight    int    // optional per-account concurrent request cap; 0 = unlimited
 	ProxyURL       string // optional outbound proxy for this account's auth-plane HTTP (token refresh / quota / OAuth)
+	runtimeID      uint64 // scheduler-assigned identity for reservation handoff across reloads
 
 	// ===== OAuth tokens — refreshable; lifetime managed by auth package =====
 	auth.Credentials
 
 	// ===== runtime state =====
-	Mu          sync.RWMutex
-	Quota       QuotaState
-	ModelStates map[string]*ModelState
-	Success     int64
-	Failed      int64
-	LastUsedAt  time.Time
+	Mu              sync.RWMutex
+	Quota           QuotaState
+	ModelStates     map[string]*ModelState
+	Success         int64
+	Failed          int64
+	InFlight        int64
+	InFlightByModel map[string]int64
+	LastUsedAt      time.Time
 
 	DisabledReason string    // populated when Disabled is set due to error
 	DisabledAt     time.Time // zero when Disabled was set manually
@@ -109,6 +115,7 @@ type View struct {
 	Priority       int
 	Disabled       bool
 	DisableCooling bool
+	MaxInFlight    int
 	DisabledReason string
 	DisabledAt     time.Time
 
@@ -117,11 +124,13 @@ type View struct {
 	AuthType   string
 	ProxyURL   string
 
-	Quota       QuotaStateView
-	ModelStates map[string]ModelStateView
-	Success     int64
-	Failed      int64
-	LastUsedAt  time.Time
+	Quota           QuotaStateView
+	ModelStates     map[string]ModelStateView
+	Success         int64
+	Failed          int64
+	InFlight        int64
+	InFlightByModel map[string]int64
+	LastUsedAt      time.Time
 
 	LastQuota        *KiroQuotaSnapshot
 	LastQuotaAt      time.Time
@@ -146,6 +155,13 @@ type ModelStateView struct {
 // IsReady reports whether the credential can be selected right now.
 // Acquires Mu (read lock).
 func (c *Credential) IsReady() bool {
+	return c.IsReadyFor("")
+}
+
+// IsReadyFor reports whether the credential can be selected for model right
+// now. It applies account-level disabled/cooldown/in-flight checks and, when
+// model is non-empty, the model-level cooldown check. Acquires Mu (read lock).
+func (c *Credential) IsReadyFor(model string) bool {
 	c.Mu.RLock()
 	defer c.Mu.RUnlock()
 	if c.Disabled {
@@ -153,6 +169,15 @@ func (c *Credential) IsReady() bool {
 	}
 	if c.Quota.Exceeded && time.Now().Before(c.Quota.NextRecoverAt) {
 		return false
+	}
+	if c.MaxInFlight > 0 && c.InFlight >= int64(c.MaxInFlight) {
+		return false
+	}
+	if model != "" && c.ModelStates != nil {
+		if ms := c.ModelStates[model]; ms != nil &&
+			ms.Quota.Exceeded && time.Now().Before(ms.Quota.NextRecoverAt) {
+			return false
+		}
 	}
 	return true
 }
@@ -176,6 +201,7 @@ func (c *Credential) Snapshot() View {
 		Priority:         c.Priority,
 		Disabled:         c.Disabled,
 		DisableCooling:   c.DisableCooling,
+		MaxInFlight:      c.MaxInFlight,
 		DisabledReason:   c.DisabledReason,
 		DisabledAt:       c.DisabledAt,
 		Region:           c.Region,
@@ -185,6 +211,7 @@ func (c *Credential) Snapshot() View {
 		Quota:            QuotaStateView(c.Quota),
 		Success:          c.Success,
 		Failed:           c.Failed,
+		InFlight:         c.InFlight,
 		LastUsedAt:       c.LastUsedAt,
 		LastQuota:        c.LastQuota,
 		LastQuotaAt:      c.LastQuotaAt,
@@ -201,5 +228,62 @@ func (c *Credential) Snapshot() View {
 			}
 		}
 	}
+	if len(c.InFlightByModel) > 0 {
+		v.InFlightByModel = make(map[string]int64, len(c.InFlightByModel))
+		for k, n := range c.InFlightByModel {
+			v.InFlightByModel[k] = n
+		}
+	}
 	return v
+}
+
+// Reserve marks one in-flight request against this credential. It returns
+// false when the credential is no longer selectable, for example because a
+// concurrent request filled the account's MaxInFlight slot after selection.
+func (c *Credential) Reserve(model string) bool {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	if c.Disabled {
+		return false
+	}
+	now := time.Now()
+	if c.Quota.Exceeded && now.Before(c.Quota.NextRecoverAt) {
+		return false
+	}
+	if c.MaxInFlight > 0 && c.InFlight >= int64(c.MaxInFlight) {
+		return false
+	}
+	if model != "" && c.ModelStates != nil {
+		if ms := c.ModelStates[model]; ms != nil &&
+			ms.Quota.Exceeded && now.Before(ms.Quota.NextRecoverAt) {
+			return false
+		}
+	}
+	c.InFlight++
+	if model != "" {
+		if c.InFlightByModel == nil {
+			c.InFlightByModel = make(map[string]int64)
+		}
+		c.InFlightByModel[model]++
+	}
+	return true
+}
+
+// ReleaseReservation removes one in-flight request from this credential.
+// It is intentionally tolerant of stale releases, so a creds reload during a
+// request cannot underflow counters.
+func (c *Credential) ReleaseReservation(model string) {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	if c.InFlight > 0 {
+		c.InFlight--
+	}
+	if model != "" && c.InFlightByModel != nil {
+		if c.InFlightByModel[model] > 1 {
+			c.InFlightByModel[model]--
+		} else {
+			delete(c.InFlightByModel, model)
+		}
+	}
+	c.LastUsedAt = time.Now()
 }

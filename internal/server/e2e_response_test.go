@@ -10,6 +10,8 @@ import (
 
 	"github.com/niuma/kirocc-pro/internal/kiroclient"
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
+	"github.com/niuma/kirocc-pro/internal/promptcache"
+	"github.com/niuma/kirocc-pro/internal/usage"
 )
 
 // errorClient always returns an error from GenerateAssistantResponse.
@@ -26,6 +28,113 @@ type headerMultiResponseClient struct {
 	headers      []http.Header
 	promptTokens int
 	callCount    int
+}
+
+func TestE2E_UsageRecordIncludesPathProfileRawAndFirstToken(t *testing.T) {
+	p1 := mustJSON(map[string]string{"content": "ok"})
+	client := &capturingClient{
+		events:       []any{"assistantResponseEvent", p1},
+		promptTokens: 10_000,
+	}
+	cfg := promptcache.ReportConfig{
+		Routes: map[string]string{"custom-a": "custom-a"},
+		Profiles: map[string]promptcache.ReportProfile{
+			"custom-a": {
+				Enabled:                true,
+				SimulateCache:          true,
+				SynthesizeStablePrefix: true,
+				TargetReadRatio:        0.90,
+				Input:                  promptcache.FieldPolicy{Mode: promptcache.FieldModeSampleMax, MaxTokens: 256, MoveDeltaToCacheRead: true},
+				Output:                 promptcache.FieldPolicy{Mode: promptcache.FieldModeRaw},
+				CacheRead:              promptcache.FieldPolicy{Mode: promptcache.FieldModePreserve},
+				CacheCreation:          promptcache.FieldPolicy{Mode: promptcache.FieldModePreserve},
+			},
+		},
+	}
+	agg := usage.NewAggregator(usage.NewMemoryStore(10), nil)
+	defer func() { _ = agg.Close() }()
+	s := New(&stubConductor{cred: newStubCred()}, stubScheduler{}, agg, "", client,
+		WithCapture(true),
+		WithPromptCacheReports(cfg),
+	)
+	srv := newTCP4TestServer(t, s.Handler())
+	defer srv.Close()
+
+	bodyBytes, _ := json.Marshal(map[string]any{
+		"model": "claude-sonnet-4-6",
+		"system": []any{map[string]any{
+			"type": "text",
+			"text": strings.Repeat("stable system prompt ", 700),
+		}},
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   false,
+	})
+	resp := postMessagesPath(t, srv.URL, "/api/custom-a/v1/messages", string(bodyBytes))
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, http.StatusOK)
+	_, _ = io.ReadAll(resp.Body)
+
+	records, err := agg.Recent(context.Background(), usage.Filter{}, 10)
+	if err != nil {
+		t.Fatalf("recent usage: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	rec := records[0]
+	if rec.RequestPath != "/api/custom-a/v1/messages" {
+		t.Fatalf("request_path = %q, want profile path", rec.RequestPath)
+	}
+	if rec.PromptCacheProfile != "custom-a" || rec.PromptCachePrefix != "/api/custom-a" {
+		t.Fatalf("profile/prefix = %q/%q, want custom-a//api/custom-a", rec.PromptCacheProfile, rec.PromptCachePrefix)
+	}
+	if rec.Status != usage.StatusSuccess {
+		t.Fatalf("status = %q, want success", rec.Status)
+	}
+	if rec.FirstTokenMs <= 0 {
+		t.Fatalf("first_token_ms = %d, want > 0", rec.FirstTokenMs)
+	}
+	if rec.RawInputTokens <= rec.InputTokens {
+		t.Fatalf("input/raw_input = %d/%d, want raw greater than sampled input", rec.InputTokens, rec.RawInputTokens)
+	}
+	if rec.RawOutputTokens != rec.OutputTokens {
+		t.Fatalf("output/raw_output = %d/%d, output raw policy must not change output", rec.OutputTokens, rec.RawOutputTokens)
+	}
+}
+
+func TestE2E_InvalidRequestIsRecordedInUsage(t *testing.T) {
+	client := &capturingClient{}
+	agg := usage.NewAggregator(usage.NewMemoryStore(10), nil)
+	defer func() { _ = agg.Close() }()
+	s := New(&stubConductor{cred: newStubCred()}, stubScheduler{}, agg, "", client)
+	srv := newTCP4TestServer(t, s.Handler())
+	defer srv.Close()
+
+	resp := postMessages(t, srv.URL, `{"model":`)
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, http.StatusBadRequest)
+	_, _ = io.ReadAll(resp.Body)
+
+	records, err := agg.Recent(context.Background(), usage.Filter{}, 10)
+	if err != nil {
+		t.Fatalf("recent usage: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	rec := records[0]
+	if rec.Status != usage.StatusInvalidRequest {
+		t.Fatalf("status = %q, want invalid_request", rec.Status)
+	}
+	if rec.RequestPath != "/v1/messages" {
+		t.Fatalf("request_path = %q, want /v1/messages", rec.RequestPath)
+	}
+	if rec.ErrorMessage == "" {
+		t.Fatal("error_message is empty")
+	}
+	if client.captured != nil {
+		t.Fatal("invalid request should not call upstream")
+	}
 }
 
 func (c *headerMultiResponseClient) GenerateAssistantResponse(ctx context.Context, token string, payload *kiroproto.Payload, region string) (*kiroclient.Response, error) {
@@ -160,6 +269,338 @@ func TestE2E_TokenUsage_CacheFields(t *testing.T) {
 	}
 	if int(usage["cache_read_input_tokens"].(float64)) != 40 {
 		t.Fatalf("cache_read = %v", usage["cache_read_input_tokens"])
+	}
+}
+
+func TestE2E_PromptCacheSimulation_CreationThenRead(t *testing.T) {
+	p1 := mustJSON(map[string]string{"content": "ok"})
+	client := &capturingClient{
+		events:       []any{"assistantResponseEvent", p1},
+		promptTokens: 10_000,
+	}
+
+	s := New(&stubConductor{cred: newStubCred()}, stubScheduler{}, nil, "", client,
+		WithCapture(true),
+		WithPromptCacheOptions(promptcache.Options{Enabled: true, TargetReadRatio: 0.90}),
+	)
+	srv := newTCP4TestServer(t, s.Handler())
+	defer srv.Close()
+
+	bodyBytes, _ := json.Marshal(map[string]any{
+		"model": "claude-sonnet-4-6",
+		"system": []any{map[string]any{
+			"type":          "text",
+			"text":          strings.Repeat("cacheable prompt ", 700),
+			"cache_control": map[string]any{"type": "ephemeral"},
+		}},
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   false,
+	})
+	body := string(bodyBytes)
+
+	resp := postMessages(t, srv.URL, body)
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, 200)
+	requireCaptured(t, client)
+	assertNoUpstreamCachePoint(t, client.captured)
+	var first map[string]any
+	_ = json.UnmarshalRead(resp.Body, &first)
+	firstUsage := first["usage"].(map[string]any)
+	if got := int(firstUsage["cache_creation_input_tokens"].(float64)); got <= 0 {
+		t.Fatalf("first cache_creation_input_tokens = %d, want > 0", got)
+	}
+	if got := int(firstUsage["cache_read_input_tokens"].(float64)); got != 0 {
+		t.Fatalf("first cache_read_input_tokens = %d, want 0", got)
+	}
+
+	resp2 := postMessages(t, srv.URL, body)
+	defer func() { _ = resp2.Body.Close() }()
+	requireStatus(t, resp2, 200)
+	var second map[string]any
+	_ = json.UnmarshalRead(resp2.Body, &second)
+	secondUsage := second["usage"].(map[string]any)
+	if got := int(secondUsage["cache_read_input_tokens"].(float64)); got <= 0 {
+		t.Fatalf("second cache_read_input_tokens = %d, want > 0", got)
+	}
+	if got := int(secondUsage["cache_creation_input_tokens"].(float64)); got != 0 {
+		t.Fatalf("second cache_creation_input_tokens = %d, want 0", got)
+	}
+	assertNoUpstreamCachePoint(t, client.captured)
+}
+
+func TestE2E_PromptCacheSimulation_DisabledByDefault(t *testing.T) {
+	p1 := mustJSON(map[string]string{"content": "ok"})
+	client := &capturingClient{
+		events:       []any{"assistantResponseEvent", p1},
+		promptTokens: 10_000,
+	}
+
+	srv := newE2EServer(t, client)
+	defer srv.Close()
+
+	bodyBytes, _ := json.Marshal(map[string]any{
+		"model": "claude-sonnet-4-6",
+		"system": []any{map[string]any{
+			"type":          "text",
+			"text":          strings.Repeat("cacheable prompt ", 700),
+			"cache_control": map[string]any{"type": "ephemeral"},
+		}},
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   false,
+	})
+	resp := postMessages(t, srv.URL, string(bodyBytes))
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, 200)
+	requireCaptured(t, client)
+	assertNoUpstreamCachePoint(t, client.captured)
+
+	var result map[string]any
+	_ = json.UnmarshalRead(resp.Body, &result)
+	usage := result["usage"].(map[string]any)
+	if got := int(usage["cache_creation_input_tokens"].(float64)); got != 0 {
+		t.Fatalf("cache_creation_input_tokens = %d, want 0 when disabled", got)
+	}
+	if got := int(usage["cache_read_input_tokens"].(float64)); got != 0 {
+		t.Fatalf("cache_read_input_tokens = %d, want 0 when disabled", got)
+	}
+}
+
+func TestE2E_PromptCacheReports_PathProfileStablePrefix(t *testing.T) {
+	p1 := mustJSON(map[string]string{"content": "ok"})
+	client := &capturingClient{
+		events:       []any{"assistantResponseEvent", p1},
+		promptTokens: 10_000,
+	}
+	cfg := promptcache.ReportConfig{
+		Routes: map[string]string{
+			"custom-a": "custom-a",
+		},
+		Profiles: map[string]promptcache.ReportProfile{
+			"custom-a": {
+				Enabled:                true,
+				SimulateCache:          true,
+				SynthesizeStablePrefix: true,
+				TargetReadRatio:        0.90,
+				Input:                  promptcache.FieldPolicy{Mode: promptcache.FieldModePreserve},
+				Output:                 promptcache.FieldPolicy{Mode: promptcache.FieldModePreserve},
+				CacheRead:              promptcache.FieldPolicy{Mode: promptcache.FieldModePreserve},
+				CacheCreation:          promptcache.FieldPolicy{Mode: promptcache.FieldModePreserve},
+			},
+		},
+	}
+	s := New(&stubConductor{cred: newStubCred()}, stubScheduler{}, nil, "", client,
+		WithCapture(true),
+		WithPromptCacheReports(cfg),
+	)
+	srv := newTCP4TestServer(t, s.Handler())
+	defer srv.Close()
+
+	bodyBytes, _ := json.Marshal(map[string]any{
+		"model": "claude-sonnet-4-6",
+		"system": []any{map[string]any{
+			"type": "text",
+			"text": strings.Repeat("stable system prompt ", 700),
+		}},
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   false,
+	})
+	body := string(bodyBytes)
+
+	resp := postMessagesPath(t, srv.URL, "/api/custom-a/v1/messages", body)
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, 200)
+	requireCaptured(t, client)
+	assertNoUpstreamCachePoint(t, client.captured)
+	var first map[string]any
+	_ = json.UnmarshalRead(resp.Body, &first)
+	firstUsage := first["usage"].(map[string]any)
+	if got := int(firstUsage["cache_creation_input_tokens"].(float64)); got <= 0 {
+		t.Fatalf("first cache_creation_input_tokens = %d, want > 0", got)
+	}
+	if got := int(firstUsage["cache_read_input_tokens"].(float64)); got != 0 {
+		t.Fatalf("first cache_read_input_tokens = %d, want 0", got)
+	}
+
+	resp2 := postMessagesPath(t, srv.URL, "/api/custom-a/v1/messages", body)
+	defer func() { _ = resp2.Body.Close() }()
+	requireStatus(t, resp2, 200)
+	var second map[string]any
+	_ = json.UnmarshalRead(resp2.Body, &second)
+	secondUsage := second["usage"].(map[string]any)
+	if got := int(secondUsage["cache_read_input_tokens"].(float64)); got <= 0 {
+		t.Fatalf("second cache_read_input_tokens = %d, want > 0", got)
+	}
+	if got := int(secondUsage["cache_creation_input_tokens"].(float64)); got != 0 {
+		t.Fatalf("second cache_creation_input_tokens = %d, want 0", got)
+	}
+	assertNoUpstreamCachePoint(t, client.captured)
+}
+
+func TestE2E_PromptCacheReports_UnmatchedPathDoesNotSimulate(t *testing.T) {
+	p1 := mustJSON(map[string]string{"content": "ok"})
+	client := &capturingClient{
+		events:       []any{"assistantResponseEvent", p1},
+		promptTokens: 10_000,
+	}
+	cfg := promptcache.ReportConfig{
+		Routes: map[string]string{
+			"custom-a": "custom-a",
+		},
+		Profiles: map[string]promptcache.ReportProfile{
+			"custom-a": {
+				Enabled:                true,
+				SimulateCache:          true,
+				SynthesizeStablePrefix: true,
+				TargetReadRatio:        0.90,
+			},
+		},
+	}
+	s := New(&stubConductor{cred: newStubCred()}, stubScheduler{}, nil, "", client,
+		WithCapture(true),
+		WithPromptCacheReports(cfg),
+	)
+	srv := newTCP4TestServer(t, s.Handler())
+	defer srv.Close()
+
+	bodyBytes, _ := json.Marshal(map[string]any{
+		"model": "claude-sonnet-4-6",
+		"system": []any{map[string]any{
+			"type": "text",
+			"text": strings.Repeat("stable system prompt ", 700),
+		}},
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"stream":   false,
+	})
+	resp := postMessages(t, srv.URL, string(bodyBytes))
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, 200)
+	var result map[string]any
+	_ = json.UnmarshalRead(resp.Body, &result)
+	usage := result["usage"].(map[string]any)
+	if got := int(usage["cache_creation_input_tokens"].(float64)); got != 0 {
+		t.Fatalf("cache_creation_input_tokens = %d, want 0 for unmatched path", got)
+	}
+	if got := int(usage["cache_read_input_tokens"].(float64)); got != 0 {
+		t.Fatalf("cache_read_input_tokens = %d, want 0 for unmatched path", got)
+	}
+}
+
+func TestE2E_PromptCacheReports_PreservesRawCacheUsageWhenNoSimulation(t *testing.T) {
+	p1 := mustJSON(map[string]string{"content": "ok"})
+	meta := mustJSON(map[string]any{
+		"tokenUsage": map[string]any{
+			"uncachedInputTokens":   50,
+			"outputTokens":          20,
+			"totalTokens":           120,
+			"cacheReadInputTokens":  40,
+			"cacheWriteInputTokens": 10,
+		},
+	})
+	client := &capturingClient{
+		events:       []any{"assistantResponseEvent", p1, "metadataEvent", meta},
+		promptTokens: 500,
+	}
+	cfg := promptcache.ReportConfig{
+		Routes: map[string]string{
+			"custom-a": "custom-a",
+		},
+		Profiles: map[string]promptcache.ReportProfile{
+			"custom-a": {
+				Enabled:                true,
+				SimulateCache:          true,
+				SynthesizeStablePrefix: true,
+				TargetReadRatio:        0.90,
+			},
+		},
+	}
+	s := New(&stubConductor{cred: newStubCred()}, stubScheduler{}, nil, "", client,
+		WithCapture(true),
+		WithPromptCacheReports(cfg),
+	)
+	srv := newTCP4TestServer(t, s.Handler())
+	defer srv.Close()
+
+	resp := postMessagesPath(t, srv.URL, "/api/custom-a/v1/messages", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, 200)
+	var result map[string]any
+	_ = json.UnmarshalRead(resp.Body, &result)
+	usage := result["usage"].(map[string]any)
+	if got := int(usage["cache_read_input_tokens"].(float64)); got != 40 {
+		t.Fatalf("cache_read_input_tokens = %d, want raw 40", got)
+	}
+	if got := int(usage["cache_creation_input_tokens"].(float64)); got != 10 {
+		t.Fatalf("cache_creation_input_tokens = %d, want raw 10", got)
+	}
+}
+
+func TestE2E_PromptCacheReports_DisabledProfilePreservesRawCacheUsage(t *testing.T) {
+	p1 := mustJSON(map[string]string{"content": "ok"})
+	meta := mustJSON(map[string]any{
+		"tokenUsage": map[string]any{
+			"uncachedInputTokens":   50,
+			"outputTokens":          20,
+			"totalTokens":           120,
+			"cacheReadInputTokens":  40,
+			"cacheWriteInputTokens": 10,
+		},
+	})
+	client := &capturingClient{
+		events:       []any{"assistantResponseEvent", p1, "metadataEvent", meta},
+		promptTokens: 500,
+	}
+	cfg := promptcache.ReportConfig{
+		Routes: map[string]string{
+			"nocache": "nocache",
+		},
+		Profiles: map[string]promptcache.ReportProfile{
+			"nocache": {Enabled: false},
+		},
+	}
+	s := New(&stubConductor{cred: newStubCred()}, stubScheduler{}, nil, "", client,
+		WithCapture(true),
+		WithPromptCacheReports(cfg),
+	)
+	srv := newTCP4TestServer(t, s.Handler())
+	defer srv.Close()
+
+	resp := postMessagesPath(t, srv.URL, "/api/nocache/v1/messages", `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	defer func() { _ = resp.Body.Close() }()
+	requireStatus(t, resp, 200)
+	var result map[string]any
+	_ = json.UnmarshalRead(resp.Body, &result)
+	usage := result["usage"].(map[string]any)
+	if got := int(usage["cache_read_input_tokens"].(float64)); got != 40 {
+		t.Fatalf("cache_read_input_tokens = %d, want raw 40", got)
+	}
+	if got := int(usage["cache_creation_input_tokens"].(float64)); got != 10 {
+		t.Fatalf("cache_creation_input_tokens = %d, want raw 10", got)
+	}
+}
+
+func assertNoUpstreamCachePoint(t *testing.T, payload *kiroproto.Payload) {
+	t.Helper()
+	if payload == nil {
+		t.Fatal("payload is nil")
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if current.CachePoint != nil {
+		t.Fatalf("current cachePoint must stay nil: %+v", current.CachePoint)
+	}
+	if current.UserInputMessageContext != nil {
+		for i, tool := range current.UserInputMessageContext.Tools {
+			if tool.CachePoint != nil {
+				t.Fatalf("tool[%d] cachePoint must stay nil: %+v", i, tool.CachePoint)
+			}
+		}
+	}
+	for i, item := range payload.ConversationState.History {
+		if item.UserInputMessage != nil && item.UserInputMessage.CachePoint != nil {
+			t.Fatalf("history[%d] user cachePoint must stay nil: %+v", i, item.UserInputMessage.CachePoint)
+		}
+		if item.AssistantResponseMessage != nil && item.AssistantResponseMessage.CachePoint != nil {
+			t.Fatalf("history[%d] assistant cachePoint must stay nil: %+v", i, item.AssistantResponseMessage.CachePoint)
+		}
 	}
 }
 

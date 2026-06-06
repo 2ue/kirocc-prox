@@ -51,6 +51,7 @@ func logUpstreamError(ctx context.Context, short string, err error, extra ...any
 			"status", ue.Status,
 			"content_type", ue.ContentType,
 			"exception", ue.Exception,
+			"retry_after", ue.RetryAfter,
 			"body", ue.Body,
 		)
 	}

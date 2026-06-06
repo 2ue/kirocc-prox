@@ -473,6 +473,7 @@ func TestIsEventStreamContentType(t *testing.T) {
 // TestUpstreamError_429 verifies that 429 errors return *UpstreamError.
 func TestUpstreamError_429(t *testing.T) {
 	srv := newTCP4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(`{"message":"slow down"}`))
 	}))
@@ -494,6 +495,31 @@ func TestUpstreamError_429(t *testing.T) {
 	}
 	if !strings.Contains(ue.Body, "slow down") {
 		t.Errorf("Body = %q, want to contain %q", ue.Body, "slow down")
+	}
+	if ue.RetryAfter != 120*time.Second {
+		t.Errorf("RetryAfter = %s, want 2m", ue.RetryAfter)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{name: "delta seconds", raw: "90", want: 90 * time.Second},
+		{name: "http date", raw: now.Add(2 * time.Minute).Format(http.TimeFormat), want: 2 * time.Minute},
+		{name: "past date", raw: now.Add(-time.Minute).Format(http.TimeFormat), want: 0},
+		{name: "invalid", raw: "later", want: 0},
+		{name: "zero", raw: "0", want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseRetryAfter(tc.raw, now); got != tc.want {
+				t.Fatalf("parseRetryAfter(%q) = %s, want %s", tc.raw, got, tc.want)
+			}
+		})
 	}
 }
 

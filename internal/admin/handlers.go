@@ -29,9 +29,7 @@ type healthResponse struct {
 	// -admin-key). The dashboard surfaces this as a top-bar warning so the
 	// operator can see at a glance that no authentication is enforced.
 	AdminKeySet bool `json:"admin_key_set"`
-	// MultiAccount is true when the server was launched with a JSON pool
-	// file. Single-account mode returns false; the dashboard hides the
-	// account-create / import / delete actions in that case.
+	// MultiAccount is true when a durable account store is attached.
 	MultiAccount bool `json:"multi_account"`
 }
 
@@ -44,9 +42,9 @@ type creditsBlock struct {
 
 // bonusBlock is the bonus / free-trial section of an account view.
 type bonusBlock struct {
-	Total          float64 `json:"total"`
-	Used           float64 `json:"used"`
-	ExpiresInDays  int     `json:"expires_in_days"`
+	Total         float64 `json:"total"`
+	Used          float64 `json:"used"`
+	ExpiresInDays int     `json:"expires_in_days"`
 }
 
 // stats24h captures 24h request/token totals for one credential.
@@ -58,58 +56,61 @@ type stats24h struct {
 
 // accountRow is one entry in the GET /admin/accounts response.
 type accountRow struct {
-	ID            string       `json:"id"`
-	Label         string       `json:"label"`
-	Provider      string       `json:"provider"`
-	Status        string       `json:"status"`
-	PlanName      string       `json:"plan_name"`
-	AuthType      string       `json:"auth_type"`
-	Region        string       `json:"region"`
-	ProfileARN    string       `json:"profile_arn"`
-	ProxyURL      string       `json:"proxy_url,omitempty"`
-	Credits       creditsBlock `json:"credits"`
-	Bonus         bonusBlock   `json:"bonus"`
-	NextResetAt   time.Time    `json:"next_reset_at"`
-	Stats24h      stats24h     `json:"stats_24h"`
-	LastUsedAt    time.Time    `json:"last_used_at"`
-	LastQuotaAt   time.Time    `json:"last_quota_at"`
-	CooldownUntil time.Time    `json:"cooldown_until"`
+	ID              string           `json:"id"`
+	Label           string           `json:"label"`
+	Provider        string           `json:"provider"`
+	Status          string           `json:"status"`
+	PlanName        string           `json:"plan_name"`
+	AuthType        string           `json:"auth_type"`
+	Region          string           `json:"region"`
+	ProfileARN      string           `json:"profile_arn"`
+	ProxyURL        string           `json:"proxy_url,omitempty"`
+	MaxInFlight     int              `json:"max_in_flight,omitempty"`
+	InFlight        int64            `json:"in_flight"`
+	InFlightByModel map[string]int64 `json:"in_flight_by_model,omitempty"`
+	Credits         creditsBlock     `json:"credits"`
+	Bonus           bonusBlock       `json:"bonus"`
+	NextResetAt     time.Time        `json:"next_reset_at"`
+	Stats24h        stats24h         `json:"stats_24h"`
+	LastUsedAt      time.Time        `json:"last_used_at"`
+	LastQuotaAt     time.Time        `json:"last_quota_at"`
+	CooldownUntil   time.Time        `json:"cooldown_until"`
 }
 
 // accountDetail extends accountRow with full unmasked detail.
 type accountDetail struct {
 	accountRow
-	Email            string                       `json:"email"`
-	ProfileARN       string                       `json:"profile_arn"`
-	Region           string                       `json:"region"`
-	AuthType         string                       `json:"auth_type"`
-	Priority         int                          `json:"priority"`
-	DisableCooling   bool                         `json:"disable_cooling"`
-	DisabledReason   string                       `json:"disabled_reason"`
-	DisabledAt       time.Time                    `json:"disabled_at"`
-	BackoffLevel     int                          `json:"backoff_level"`
-	Success          int64                        `json:"success_total"`
-	Failed           int64                        `json:"failed_total"`
-	LastQuotaAt      time.Time                    `json:"last_quota_at"`
-	LastQuotaError   string                       `json:"last_quota_error"`
-	LastQuotaErrorAt time.Time                    `json:"last_quota_error_at"`
-	ModelStates     map[string]pool.ModelStateView `json:"model_states,omitempty"`
+	Email            string                         `json:"email"`
+	ProfileARN       string                         `json:"profile_arn"`
+	Region           string                         `json:"region"`
+	AuthType         string                         `json:"auth_type"`
+	Priority         int                            `json:"priority"`
+	DisableCooling   bool                           `json:"disable_cooling"`
+	DisabledReason   string                         `json:"disabled_reason"`
+	DisabledAt       time.Time                      `json:"disabled_at"`
+	BackoffLevel     int                            `json:"backoff_level"`
+	Success          int64                          `json:"success_total"`
+	Failed           int64                          `json:"failed_total"`
+	LastQuotaAt      time.Time                      `json:"last_quota_at"`
+	LastQuotaError   string                         `json:"last_quota_error"`
+	LastQuotaErrorAt time.Time                      `json:"last_quota_error_at"`
+	ModelStates      map[string]pool.ModelStateView `json:"model_states,omitempty"`
 }
 
 // usageRow is one row of GET /admin/usage. The dimension columns
 // (Model / APIKeyID / Label / Device) are populated depending on the
 // group= query parameter — only the relevant ones are set.
 type usageRow struct {
-	Model            string  `json:"model,omitempty"`
-	APIKeyID         string  `json:"api_key_id,omitempty"`
-	Label            string  `json:"label,omitempty"` // resolved label for api_key group
-	Device           string  `json:"device,omitempty"`
-	Requests         int64   `json:"requests"`
-	Success          int64   `json:"success"`
-	Failed           int64   `json:"failed"`
-	AvgLatencyMs     float64 `json:"avg_latency_ms,omitempty"`
-	InputTokens      int64   `json:"input_tokens"`
-	OutputTokens     int64   `json:"output_tokens"`
+	Model        string  `json:"model,omitempty"`
+	APIKeyID     string  `json:"api_key_id,omitempty"`
+	Label        string  `json:"label,omitempty"` // resolved label for api_key group
+	Device       string  `json:"device,omitempty"`
+	Requests     int64   `json:"requests"`
+	Success      int64   `json:"success"`
+	Failed       int64   `json:"failed"`
+	AvgLatencyMs float64 `json:"avg_latency_ms,omitempty"`
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
 }
 
 // usageResponse is the envelope around the rolled-up rows.
@@ -141,10 +142,10 @@ type timelineBucketDTO struct {
 
 // timelineResponse wraps Aggregate.Timeline with window meta.
 type timelineResponse struct {
-	WindowStart time.Time            `json:"window_start"`
-	WindowEnd   time.Time            `json:"window_end"`
-	Bucket      string               `json:"bucket"`
-	Timeline    []timelineBucketDTO  `json:"timeline"`
+	WindowStart time.Time           `json:"window_start"`
+	WindowEnd   time.Time           `json:"window_end"`
+	Bucket      string              `json:"bucket"`
+	Timeline    []timelineBucketDTO `json:"timeline"`
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -170,9 +171,9 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 //  2. Plain label: only the first identifier-looking run is masked;
 //     trailing decoration after whitespace or '(' / '[' is preserved.
 //     Examples:
-//       "kiro-alice-001" → "k*************"     (whole thing masked)
-//       "Alice Pro"      → "A**** Pro"
-//       "alice"          → "a****"
+//     "kiro-alice-001" → "k*************"     (whole thing masked)
+//     "Alice Pro"      → "A**** Pro"
+//     "alice"          → "a****"
 //
 // Labels under 2 chars are returned unchanged (nothing meaningful to mask).
 func maskEmail(s string) string {
@@ -233,17 +234,20 @@ func buildAccountRow(v pool.View, label string, st stats24h) accountRow {
 		prov = "kiro"
 	}
 	row := accountRow{
-		ID:          v.ID,
-		Label:       label,
-		Provider:    prov,
-		Status:      statusFor(v),
-		AuthType:    v.AuthType,
-		Region:      v.Region,
-		ProfileARN:  v.ProfileARN,
-		ProxyURL:    v.ProxyURL,
-		LastUsedAt:  v.LastUsedAt,
-		LastQuotaAt: v.LastQuotaAt,
-		Stats24h:    st,
+		ID:              v.ID,
+		Label:           label,
+		Provider:        prov,
+		Status:          statusFor(v),
+		AuthType:        v.AuthType,
+		Region:          v.Region,
+		ProfileARN:      v.ProfileARN,
+		ProxyURL:        v.ProxyURL,
+		MaxInFlight:     v.MaxInFlight,
+		InFlight:        v.InFlight,
+		InFlightByModel: v.InFlightByModel,
+		LastUsedAt:      v.LastUsedAt,
+		LastQuotaAt:     v.LastQuotaAt,
+		Stats24h:        st,
 	}
 	if v.LastQuota != nil {
 		q := v.LastQuota
@@ -324,7 +328,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		TotalAccounts: len(all),
 		GeneratedAt:   time.Now(),
 		AdminKeySet:   s.adminKey != "",
-		MultiAccount:  s.credsPath != "",
+		MultiAccount:  s.credStore != nil,
 	}
 	for _, c := range all {
 		v := c.Snapshot()
@@ -566,13 +570,25 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 type recentRecordDTO struct {
 	Timestamp            time.Time `json:"timestamp"`
 	CredentialID         string    `json:"credential_id"`
+	CredentialLabel      string    `json:"credential_label,omitempty"`
+	RequestPath          string    `json:"request_path"`
+	PromptCacheProfile   string    `json:"prompt_cache_profile,omitempty"`
+	PromptCachePrefix    string    `json:"prompt_cache_prefix,omitempty"`
 	Type                 string    `json:"type"`
 	RequestedModel       string    `json:"requested_model"`
 	ResolvedModel        string    `json:"resolved_model"`
 	Status               string    `json:"status"`
 	InputTokens          int       `json:"input_tokens"`
 	OutputTokens         int       `json:"output_tokens"`
+	CacheReadTokens      int       `json:"cache_read_tokens"`
+	CacheWriteTokens     int       `json:"cache_write_tokens"`
+	RawInputTokens       int       `json:"raw_input_tokens"`
+	RawOutputTokens      int       `json:"raw_output_tokens"`
+	RawCacheReadTokens   int       `json:"raw_cache_read_tokens"`
+	RawCacheWriteTokens  int       `json:"raw_cache_write_tokens"`
 	LatencyMs            int       `json:"latency_ms"`
+	FirstTokenMs         int       `json:"first_token_ms"`
+	ErrorMessage         string    `json:"error_message,omitempty"`
 	Device               string    `json:"device"`
 	DeviceID             string    `json:"device_id,omitempty"`
 	APIKeyID             string    `json:"api_key_id,omitempty"`
@@ -604,18 +620,31 @@ func (s *Server) handleUsageRecent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	labels := s.apiKeyLabels()
+	credLabels := s.credentialLabels()
 	out := make([]recentRecordDTO, 0, len(records))
 	for _, rec := range records {
 		out = append(out, recentRecordDTO{
 			Timestamp:            rec.Timestamp,
 			CredentialID:         rec.CredentialID,
+			CredentialLabel:      credLabels[rec.CredentialID],
+			RequestPath:          rec.RequestPath,
+			PromptCacheProfile:   rec.PromptCacheProfile,
+			PromptCachePrefix:    rec.PromptCachePrefix,
 			Type:                 rec.Type,
 			RequestedModel:       rec.RequestedModel,
 			ResolvedModel:        rec.ResolvedModel,
 			Status:               rec.Status,
 			InputTokens:          rec.InputTokens,
 			OutputTokens:         rec.OutputTokens,
+			CacheReadTokens:      rec.CacheReadTokens,
+			CacheWriteTokens:     rec.CacheWriteTokens,
+			RawInputTokens:       rec.RawInputTokens,
+			RawOutputTokens:      rec.RawOutputTokens,
+			RawCacheReadTokens:   rec.RawCacheReadTokens,
+			RawCacheWriteTokens:  rec.RawCacheWriteTokens,
 			LatencyMs:            rec.LatencyMs,
+			FirstTokenMs:         rec.FirstTokenMs,
+			ErrorMessage:         rec.ErrorMessage,
 			Device:               rec.Device,
 			DeviceID:             rec.DeviceID,
 			APIKeyID:             rec.APIKeyID,
@@ -738,6 +767,28 @@ func (s *Server) apiKeyLabels() map[string]string {
 	out := make(map[string]string, len(cur.APIKeys))
 	for _, k := range cur.APIKeys {
 		out[k.ID] = k.Label
+	}
+	return out
+}
+
+// credentialLabels returns credential_id -> display label for recent request
+// history. The id is returned separately and the UI can expose it on hover.
+func (s *Server) credentialLabels() map[string]string {
+	if s.sched == nil {
+		return nil
+	}
+	all := s.sched.All()
+	out := make(map[string]string, len(all))
+	for _, c := range all {
+		if c == nil {
+			continue
+		}
+		v := c.Snapshot()
+		label := strings.TrimSpace(v.Label)
+		if label == "" {
+			label = v.ID
+		}
+		out[v.ID] = label
 	}
 	return out
 }

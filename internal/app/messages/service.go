@@ -1,20 +1,22 @@
 package messages
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/niuma/kirocc-pro/internal/dashboard"
 	"github.com/niuma/kirocc-pro/internal/kiroclient"
 	"github.com/niuma/kirocc-pro/internal/pool"
+	"github.com/niuma/kirocc-pro/internal/promptcache"
 	"github.com/niuma/kirocc-pro/internal/provider"
 	"github.com/niuma/kirocc-pro/internal/usage"
 )
 
 // Service owns message execution and token counting flows.
 //
-// [fork] Acquires credentials via pool.Conductor (rather than a direct
-// TokenGetter), so the handler can transparently support both the
-// single-account SQLite path and a multi-account JSON pool. Each request
+// [fork] Acquires credentials via pool.Conductor so requests use the
+// PostgreSQL account pool and Redis-coordinated runtime state. Each request
 // also publishes a usage.Record after the upstream call settles.
 type Service struct {
 	conductor      pool.Conductor
@@ -24,6 +26,7 @@ type Service struct {
 	captureEnabled bool
 	collector      *dashboard.Collector
 	registry       *provider.Registry // optional; used to refuse non-Kiro routes until Phase III.2
+	promptCache    *promptcache.Tracker
 
 	// apiKeyUsageRecorder bumps the matched dynamic API key's used_tokens
 	// counter after every successful request, so the auth middleware can
@@ -33,6 +36,9 @@ type Service struct {
 	// regionHinter is called per request to derive the preferred upstream
 	// region. nil = no region routing (pool falls back to plain strategy).
 	regionHinter func(r *http.Request) string
+
+	promptCacheReports        promptcache.ReportConfig
+	promptCacheReportProvider func() promptcache.ReportConfig
 }
 
 // Option configures a Service.
@@ -74,11 +80,48 @@ func WithRegionHinter(fn func(r *http.Request) string) Option {
 	return func(s *Service) { s.regionHinter = fn }
 }
 
+// WithPromptCacheOptions configures the local prompt-cache usage simulator.
+func WithPromptCacheOptions(opts promptcache.Options) Option {
+	return func(s *Service) {
+		if opts.Enabled {
+			s.promptCache = promptcache.NewTracker(opts)
+			s.promptCacheReports = promptcache.LegacyReportConfig(opts)
+		}
+	}
+}
+
+// WithPromptCacheReports configures path/profile-driven local usage reporting.
+func WithPromptCacheReports(cfg promptcache.ReportConfig) Option {
+	return func(s *Service) {
+		cfg = cfg.Normalized()
+		if cfg.Empty() {
+			return
+		}
+		s.promptCacheReports = cfg
+		if s.promptCache == nil {
+			s.promptCache = promptcache.NewTracker(promptcache.DefaultOptions())
+		}
+	}
+}
+
+// WithPromptCacheReportProvider configures an authoritative runtime source for
+// path/profile reporting, typically PostgreSQL settings edited from the admin UI.
+func WithPromptCacheReportProvider(fn func() promptcache.ReportConfig) Option {
+	return func(s *Service) {
+		if fn == nil {
+			return
+		}
+		s.promptCacheReportProvider = fn
+		if s.promptCache == nil {
+			s.promptCache = promptcache.NewTracker(promptcache.DefaultOptions())
+		}
+	}
+}
+
 // New constructs a message service.
 //
-// conductor and scheduler are required (use pool.NewSingleAccount for the
-// single-account fallback). aggregator may be nil; when nil, per-request
-// usage records are dropped silently.
+// conductor and scheduler are required. aggregator may be nil; when nil,
+// per-request usage records are dropped silently.
 func New(conductor pool.Conductor, scheduler pool.Scheduler, aggregator usage.Aggregator, client kiroclient.Client, opts ...Option) *Service {
 	s := &Service{
 		conductor:  conductor,
@@ -90,4 +133,13 @@ func New(conductor pool.Conductor, scheduler pool.Scheduler, aggregator usage.Ag
 		opt(s)
 	}
 	return s
+}
+
+// RunPromptCacheJanitor periodically trims the optional local prompt-cache
+// tracker. It is a no-op when prompt-cache reporting is not configured.
+func (s *Service) RunPromptCacheJanitor(ctx context.Context, interval time.Duration) {
+	if s == nil || s.promptCache == nil {
+		return
+	}
+	s.promptCache.RunJanitor(ctx, interval)
 }

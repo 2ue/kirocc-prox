@@ -16,12 +16,17 @@ func TestScheduler_RegisterPreservesState(t *testing.T) {
 	c1 := newCred("a", 100)
 	s.Register([]*Credential{c1})
 
+	if !c1.Reserve("claude") {
+		t.Fatal("Reserve returned false")
+	}
 	s.MarkSuccess("a", "claude", Usage{InputTokens: 10})
 	s.MarkRateLimit("a", "claude", 0)
 
 	c1.Mu.RLock()
 	wantSuccess := c1.Success
 	wantFailed := c1.Failed
+	wantInFlight := c1.InFlight
+	wantModelInFlight := c1.InFlightByModel["claude"]
 	wantLevel := c1.Quota.BackoffLevel
 	wantNext := c1.Quota.NextRecoverAt
 	c1.Mu.RUnlock()
@@ -37,6 +42,12 @@ func TestScheduler_RegisterPreservesState(t *testing.T) {
 	}
 	if c2.Failed != wantFailed {
 		t.Errorf("Failed: got %d want %d", c2.Failed, wantFailed)
+	}
+	if c2.InFlight != wantInFlight {
+		t.Errorf("InFlight: got %d want %d", c2.InFlight, wantInFlight)
+	}
+	if got := c2.InFlightByModel["claude"]; got != wantModelInFlight {
+		t.Errorf("InFlightByModel[claude]: got %d want %d", got, wantModelInFlight)
 	}
 	if c2.Quota.BackoffLevel != wantLevel {
 		t.Errorf("BackoffLevel: got %d want %d", c2.Quota.BackoffLevel, wantLevel)
@@ -217,6 +228,61 @@ func TestScheduler_ReadySortedByPriorityDesc(t *testing.T) {
 		if got[i].ID != id {
 			t.Errorf("pos %d: got %s want %s", i, got[i].ID, id)
 		}
+	}
+}
+
+func TestScheduler_ReadyExcludesMaxInFlightFull(t *testing.T) {
+	s := NewDefaultScheduler()
+	a := newCred("a", 100)
+	a.MaxInFlight = 1
+	b := newCred("b", 90)
+	s.Register([]*Credential{a, b})
+
+	if !a.Reserve("") {
+		t.Fatal("Reserve returned false")
+	}
+
+	ready := s.Ready()
+	if len(ready) != 1 {
+		t.Fatalf("Ready len = %d want 1: %+v", len(ready), credIDs(ready))
+	}
+	if ready[0].ID != "b" {
+		t.Errorf("expected b, got %s", ready[0].ID)
+	}
+}
+
+func TestCredential_ReserveReleaseAndModelCooldown(t *testing.T) {
+	c := newCred("a", 100)
+	c.MaxInFlight = 2
+	c.ModelStates = map[string]*ModelState{
+		"blocked": {
+			Quota: QuotaState{
+				Exceeded:      true,
+				NextRecoverAt: time.Now().Add(time.Minute),
+			},
+		},
+	}
+
+	if !c.IsReadyFor("open") {
+		t.Fatal("credential should be ready for unrelated model")
+	}
+	if c.IsReadyFor("blocked") {
+		t.Fatal("credential should not be ready for model cooldown")
+	}
+	if !c.Reserve("open") || !c.Reserve("open") {
+		t.Fatal("first two reserves should succeed")
+	}
+	if c.Reserve("open") {
+		t.Fatal("reserve above MaxInFlight should fail")
+	}
+	c.ReleaseReservation("open")
+	if !c.Reserve("open") {
+		t.Fatal("reserve after release should succeed")
+	}
+	c.ReleaseReservation("open")
+	c.ReleaseReservation("open")
+	if got := c.Snapshot().InFlight; got != 0 {
+		t.Fatalf("InFlight = %d, want 0", got)
 	}
 }
 

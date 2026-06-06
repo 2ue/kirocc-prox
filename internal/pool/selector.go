@@ -18,6 +18,24 @@ type Selector interface {
 	Pick(ready []*Credential, model string) (*Credential, error)
 }
 
+// NewSelector returns the configured scheduling strategy. Unknown values fall
+// back to round-robin; Config.Validate is responsible for rejecting invalid
+// operator input before production startup.
+func NewSelector(strategy string) Selector {
+	switch strategy {
+	case "fill-first":
+		return &FillFirstSelector{}
+	case "least-used":
+		return &LeastUsedSelector{}
+	case "least-inflight":
+		return &LeastInFlightSelector{}
+	case "weighted-least-inflight":
+		return &WeightedLeastInFlightSelector{}
+	default:
+		return &RoundRobinSelector{}
+	}
+}
+
 // RoundRobinSelector cycles through ready credentials in priority order.
 // The cursor advances on each Pick; it is reset when the ready set
 // composition changes (additions / removals).
@@ -36,4 +54,13 @@ type FillFirstSelector struct{}
 // over time.
 type LeastUsedSelector struct{}
 
-// Pick methods on these three selectors live in selector_strategies.go.
+// LeastInFlightSelector picks the ready credential with the fewest currently
+// running requests inside the top-priority group.
+type LeastInFlightSelector struct{}
+
+// WeightedLeastInFlightSelector picks the ready credential with the lowest
+// in-flight / max-in-flight load ratio inside the top-priority group. Accounts
+// without a max cap are treated as having a very large capacity.
+type WeightedLeastInFlightSelector struct{}
+
+// Pick methods on these selectors live in selector_strategies.go.

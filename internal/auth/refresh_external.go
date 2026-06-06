@@ -1,8 +1,5 @@
-// [fork] New file added in fork. Exposes the OAuth refresh path as a
-// standalone function so the multi-account pool (internal/pool) can refresh
-// individual *Credentials without going through AuthManager (which is tied
-// to a single SQLite database). AuthManager keeps using its existing private
-// methods unchanged.
+// [fork] Exposes the OAuth refresh path as a standalone function so the
+// PostgreSQL-backed account pool can refresh individual *Credentials.
 
 package auth
 

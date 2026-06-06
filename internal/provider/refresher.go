@@ -4,31 +4,23 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/niuma/kirocc-pro/internal/pool"
 )
 
 // MultiRefresher implements pool.Refresher by dispatching to the per-cred
-// Provider.RefreshToken. After a successful refresh it atomically writes
-// the full pool snapshot back to savePath (when non-empty) so the rotated
-// tokens survive a restart.
+// Provider.RefreshToken. After a successful refresh it persists the rotated
+// credential through the configured durable account store.
 type MultiRefresher struct {
 	registry *Registry
-	savePath string
-	allCreds func() []*pool.Credential
-
-	saveMu sync.Mutex // serializes disk writes
+	saveOne  func(context.Context, *pool.Credential) error
 }
 
-// NewMultiRefresher constructs a Refresher routing through registry. If
-// savePath is empty, refreshes only update in-memory credentials.
-func NewMultiRefresher(registry *Registry, savePath string, allCreds func() []*pool.Credential) *MultiRefresher {
+func NewMultiRefresherWithPersister(registry *Registry, saveOne func(context.Context, *pool.Credential) error) *MultiRefresher {
 	return &MultiRefresher{
 		registry: registry,
-		savePath: savePath,
-		allCreds: allCreds,
+		saveOne:  saveOne,
 	}
 }
 
@@ -46,9 +38,9 @@ func (r *MultiRefresher) ShouldRefresh(cred *pool.Credential) bool {
 }
 
 // Refresh looks up the credential's provider and invokes its RefreshToken.
-// On success the full pool is persisted to savePath. On provider lookup
-// failure (unknown provider id), returns a wrapped error WITHOUT touching
-// the credential.
+// On success the rotated credential is persisted to PostgreSQL. On provider
+// lookup failure (unknown provider id), returns a wrapped error WITHOUT
+// touching the credential.
 func (r *MultiRefresher) Refresh(ctx context.Context, cred *pool.Credential) error {
 	cred.Mu.RLock()
 	provID := cred.Provider
@@ -64,12 +56,10 @@ func (r *MultiRefresher) Refresh(ctx context.Context, cred *pool.Credential) err
 		return err
 	}
 
-	if r.savePath != "" && r.allCreds != nil {
-		r.saveMu.Lock()
-		defer r.saveMu.Unlock()
-		if err := pool.SaveToJSON(r.savePath, r.allCreds()); err != nil {
-			slog.WarnContext(ctx, "provider: persist refreshed creds failed",
-				"path", r.savePath, "cred_id", cred.ID, "err", err)
+	if r.saveOne != nil {
+		if err := r.saveOne(ctx, cred); err != nil {
+			slog.WarnContext(ctx, "provider: persist refreshed credential failed",
+				"cred_id", cred.ID, "err", err)
 		}
 	}
 	return nil

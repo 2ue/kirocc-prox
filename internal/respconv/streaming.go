@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/niuma/kirocc-pro/internal/anthropic"
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
-	"github.com/google/uuid"
 )
 
 // SSEWriter writes Anthropic-compatible SSE events to an http.ResponseWriter.
@@ -315,11 +315,53 @@ func (s *SSEWriter) Usage() (inputTokens, outputTokens int) {
 	return s.acc.resolvedUsage()
 }
 
+// RawUsage returns input/output token counts before local usage adjustment.
+func (s *SSEWriter) RawUsage() (inputTokens, outputTokens int) {
+	if s.acc.FinalUsage != nil || s.acc.RawInputTokens > 0 || s.acc.RawOutputTokens > 0 {
+		return s.acc.RawInputTokens, s.acc.RawOutputTokens
+	}
+	return s.acc.rawResolvedUsage()
+}
+
 // CacheReadInputTokens returns the cache read input token count.
 func (s *SSEWriter) CacheReadInputTokens() int { return s.acc.CacheReadInputTokens }
 
 // CacheWriteInputTokens returns the cache write input token count.
 func (s *SSEWriter) CacheWriteInputTokens() int { return s.acc.CacheWriteInputTokens }
+
+// RawCacheReadInputTokens returns the cache read count before local adjustment.
+func (s *SSEWriter) RawCacheReadInputTokens() int {
+	if s.acc.FinalUsage != nil || s.acc.RawCacheReadTokens > 0 {
+		return s.acc.RawCacheReadTokens
+	}
+	return s.acc.CacheReadInputTokens
+}
+
+// RawCacheWriteInputTokens returns the cache creation count before local adjustment.
+func (s *SSEWriter) RawCacheWriteInputTokens() int {
+	if s.acc.FinalUsage != nil || s.acc.RawCacheWriteTokens > 0 {
+		return s.acc.RawCacheWriteTokens
+	}
+	return s.acc.CacheWriteInputTokens
+}
+
+// FinalCacheReadInputTokens returns the final cache read count after any
+// optional usage adjustment has been applied.
+func (s *SSEWriter) FinalCacheReadInputTokens() int {
+	if s.acc.FinalUsage != nil {
+		return s.acc.FinalUsage.CacheReadInputTokens
+	}
+	return s.acc.CacheReadInputTokens
+}
+
+// FinalCacheWriteInputTokens returns the final cache creation count after any
+// optional usage adjustment has been applied.
+func (s *SSEWriter) FinalCacheWriteInputTokens() int {
+	if s.acc.FinalUsage != nil {
+		return s.acc.FinalUsage.CacheWriteInputTokens
+	}
+	return s.acc.CacheWriteInputTokens
+}
 
 // ContextUsagePercentage returns the context usage percentage from Kiro, or 0 if not received.
 func (s *SSEWriter) ContextUsagePercentage() float64 { return s.acc.ContextUsagePercentage }
@@ -400,16 +442,23 @@ func (s *SSEWriter) SetToolInputValidator(v *ToolInputValidator) {
 	s.acc.toolInputValidator = v
 }
 
+// SetUsageAdjuster wires an optional usage hook evaluated once at finalization.
+func (s *SSEWriter) SetUsageAdjuster(fn UsageAdjuster) {
+	s.acc.UsageAdjuster = fn
+}
+
 // ResetAccumulator replaces the internal accumulator with a fresh one,
 // preserving the SSEWriter's block index and started state for continuation.
 func (s *SSEWriter) ResetAccumulator(contextWindowSize int, stopSequences []string, maxTokens int, preCountedInputTokens int) {
 	filterName := s.acc.DropToolName
 	nameMap := s.acc.toolNameMap
 	validator := s.acc.toolInputValidator
+	adjuster := s.acc.UsageAdjuster
 	s.acc = newAccumulator(contextWindowSize, stopSequences, maxTokens, preCountedInputTokens)
 	s.acc.DropToolName = filterName
 	s.acc.toolNameMap = nameMap
 	s.acc.toolInputValidator = validator
+	s.acc.UsageAdjuster = adjuster
 	s.activeType = ""
 }
 

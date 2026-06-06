@@ -38,7 +38,7 @@ type optimizationsResponse struct {
 
 // handleOptimizations returns the 8 kirocc fork fixes + the current
 // effective values for the experimental / thinking knobs. The
-// "effective" view is: env var if set, else the persisted settings.json
+// "effective" view is: env var if set, else the persisted PostgreSQL settings
 // value (which is loaded into env at startup via Optimizations.ApplyToEnv).
 func (s *Server) handleOptimizations(w http.ResponseWriter, _ *http.Request) {
 	resp := optimizationsResponse{

@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/niuma/kirocc-pro/internal/anthropic"
 	"github.com/google/uuid"
+	"github.com/niuma/kirocc-pro/internal/anthropic"
 )
 
 type webSearchResult struct {
@@ -36,15 +36,18 @@ func (s *Service) handleLocalWebSearch(ctx context.Context, w http.ResponseWrite
 	query := extractWebSearchQuery(req)
 	if query == "" {
 		writeLocalWebSearchError(ctx, w, req.Stream, model, "invalid_input", "empty web search query")
+		markMetricsFirstToken(w)
 		return
 	}
 	results, err := duckDuckGoHTMLSearch(ctx, query, 5)
 	if err != nil {
 		slog.WarnContext(ctx, "local web search failed", "trace_id", short, "err", err)
 		writeLocalWebSearchError(ctx, w, req.Stream, model, "unavailable", err.Error())
+		markMetricsFirstToken(w)
 		return
 	}
 	writeLocalWebSearchResponse(ctx, w, req.Stream, model, query, results)
+	markMetricsFirstToken(w)
 	logResponseStats(ctx, short, 0, 0, false, 0, contextWindowSize)
 	_ = ccSessionID
 }

@@ -2,7 +2,9 @@ package quota
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,23 +17,75 @@ type DefaultPoller struct {
 	cache         Cache
 	interval      time.Duration
 	maxConcurrent int
+
+	credentialFetcher CredentialFetcher
+	refresher         TokenRefresher
+
+	backoffMu sync.Mutex
+	backoff   map[string]pollBackoff
 }
 
-// NewPoller constructs a poller. Non-positive values fall back to the
-// package defaults.
-func NewPoller(s pool.Scheduler, c Cache, interval time.Duration, maxConcurrent int) Poller {
-	if interval <= 0 {
+type disabledPoller struct{}
+
+// CredentialFetcher fetches quota from a live credential instead of a token
+// snapshot. Provider registries implement this to honor per-account routing.
+type CredentialFetcher interface {
+	FetchQuota(ctx context.Context, cred *pool.Credential) (*pool.KiroQuotaSnapshot, error)
+}
+
+// TokenRefresher refreshes one credential in place.
+type TokenRefresher interface {
+	Refresh(ctx context.Context, cred *pool.Credential) error
+}
+
+type PollerOption func(*DefaultPoller)
+
+func WithCredentialFetcher(fetcher CredentialFetcher) PollerOption {
+	return func(p *DefaultPoller) {
+		p.credentialFetcher = fetcher
+	}
+}
+
+func WithRefresher(refresher TokenRefresher) PollerOption {
+	return func(p *DefaultPoller) {
+		p.refresher = refresher
+	}
+}
+
+type pollBackoff struct {
+	failures int
+	until    time.Time
+}
+
+// NewPoller constructs a poller. An interval of 0 disables polling; negative
+// intervals fall back to the package default for direct package callers.
+func NewPoller(s pool.Scheduler, c Cache, interval time.Duration, maxConcurrent int, opts ...PollerOption) Poller {
+	if interval == 0 {
+		return disabledPoller{}
+	}
+	if interval < 0 {
 		interval = DefaultPollInterval
 	}
 	if maxConcurrent <= 0 {
 		maxConcurrent = DefaultMaxConcurrent
 	}
-	return &DefaultPoller{
+	p := &DefaultPoller{
 		scheduler:     s,
 		cache:         c,
 		interval:      interval,
 		maxConcurrent: maxConcurrent,
+		backoff:       make(map[string]pollBackoff),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(p)
+		}
+	}
+	return p
+}
+
+func (disabledPoller) Run(ctx context.Context) {
+	<-ctx.Done()
 }
 
 // Run blocks until ctx is cancelled. One immediate refresh runs before the
@@ -83,12 +137,14 @@ func (p *DefaultPoller) refreshAll(ctx context.Context) {
 		region := cred.Region
 		cred.Mu.RUnlock()
 
-		// Skip credentials that have not been initialized yet (single-account
-		// mode before the first request loads the SQLite DB, or a JSON entry
-		// missing required fields). Polling would just produce HTTP 400s.
+		// Skip credentials that have not been initialized yet. Polling would
+		// just produce HTTP 400s.
 		if token == "" || arn == "" {
 			slog.DebugContext(ctx, "quota: skipping credential without token/profileArn",
 				"cred_id", credID)
+			continue
+		}
+		if p.shouldSkipBackoff(credID, time.Now()) {
 			continue
 		}
 
@@ -103,20 +159,112 @@ func (p *DefaultPoller) refreshAll(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			p.refreshOne(ctx, credID, token, arn, region)
+			p.refreshOne(ctx, cred, credID, token, arn, region)
 		}()
 	}
 
 	wg.Wait()
 }
 
-func (p *DefaultPoller) refreshOne(ctx context.Context, credID, token, arn, region string) {
-	snap, err := p.cache.FetchForce(ctx, credID, token, arn, region)
+func (p *DefaultPoller) refreshOne(ctx context.Context, cred *pool.Credential, credID, token, arn, region string) {
+	snap, err := p.fetchQuota(ctx, cred, credID, token, arn, region)
 	if err != nil {
+		if isQuotaAuthError(err) && p.refresher != nil && cred != nil {
+			refreshErr := p.refresher.Refresh(ctx, cred)
+			if refreshErr == nil {
+				token, arn, region = readQuotaInputs(cred)
+				snap, err = p.fetchQuota(ctx, cred, credID, token, arn, region)
+				if err == nil {
+					p.scheduler.RefreshQuota(credID, snap)
+					p.clearBackoff(credID)
+					return
+				}
+			} else {
+				err = fmt.Errorf("token refresh: %w (original: %v)", refreshErr, err)
+			}
+		}
 		slog.WarnContext(ctx, "quota: refresh failed",
 			"cred_id", credID, "err", err)
 		p.scheduler.RecordQuotaError(credID, err.Error())
+		p.recordFailure(credID, time.Now())
 		return
 	}
 	p.scheduler.RefreshQuota(credID, snap)
+	p.clearBackoff(credID)
+}
+
+func (p *DefaultPoller) fetchQuota(ctx context.Context, cred *pool.Credential, credID, token, arn, region string) (*pool.KiroQuotaSnapshot, error) {
+	if p.credentialFetcher != nil && cred != nil {
+		return p.credentialFetcher.FetchQuota(ctx, cred)
+	}
+	return p.cache.FetchForce(ctx, credID, token, arn, region)
+}
+
+func readQuotaInputs(cred *pool.Credential) (token, arn, region string) {
+	if cred == nil {
+		return "", "", ""
+	}
+	cred.Mu.RLock()
+	defer cred.Mu.RUnlock()
+	return cred.AccessToken, cred.ProfileARN, cred.Region
+}
+
+func (p *DefaultPoller) shouldSkipBackoff(credID string, now time.Time) bool {
+	p.backoffMu.Lock()
+	defer p.backoffMu.Unlock()
+	b, ok := p.backoff[credID]
+	if !ok {
+		return false
+	}
+	if now.Before(b.until) {
+		return true
+	}
+	return false
+}
+
+func (p *DefaultPoller) recordFailure(credID string, now time.Time) {
+	p.backoffMu.Lock()
+	defer p.backoffMu.Unlock()
+	b := p.backoff[credID]
+	b.failures++
+	b.until = now.Add(nextPollBackoff(p.interval, b.failures))
+	p.backoff[credID] = b
+}
+
+func (p *DefaultPoller) clearBackoff(credID string) {
+	p.backoffMu.Lock()
+	defer p.backoffMu.Unlock()
+	delete(p.backoff, credID)
+}
+
+func nextPollBackoff(interval time.Duration, failures int) time.Duration {
+	if failures <= 0 {
+		failures = 1
+	}
+	if interval <= 0 {
+		interval = DefaultPollInterval
+	}
+	multiplier := 1 << min(failures, 4)
+	d := time.Duration(multiplier) * interval
+	maxBackoff := 30 * time.Minute
+	if d > maxBackoff {
+		return maxBackoff
+	}
+	if d < time.Minute {
+		return time.Minute
+	}
+	return d
+}
+
+func isQuotaAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "status 401") ||
+		strings.Contains(msg, "status 403") ||
+		strings.Contains(msg, "bearer token") ||
+		strings.Contains(msg, "expired") ||
+		strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "forbidden")
 }

@@ -4,9 +4,9 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/niuma/kirocc-pro/internal/anthropic"
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
-	"github.com/google/uuid"
 )
 
 // extractToolUseIDs returns the IDs of all tool_use blocks in a message's content.

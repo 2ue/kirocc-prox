@@ -12,7 +12,7 @@ import (
 // existing handler tests rely on this).
 
 func TestCSRF_JSONContentTypeAllowed(t *testing.T) {
-	s := NewServer("127.0.0.1", 0, "k", "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
+	s := NewServer("127.0.0.1", 0, "k", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 	client := newRawClient()
@@ -31,7 +31,7 @@ func TestCSRF_JSONContentTypeAllowed(t *testing.T) {
 }
 
 func TestCSRF_BearerAllowed(t *testing.T) {
-	s := NewServer("127.0.0.1", 0, "k", "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
+	s := NewServer("127.0.0.1", 0, "k", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 	client := newRawClient()
@@ -49,7 +49,7 @@ func TestCSRF_BearerAllowed(t *testing.T) {
 }
 
 func TestCSRF_BlocksPlainPost(t *testing.T) {
-	s := NewServer("127.0.0.1", 0, "k", "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
+	s := NewServer("127.0.0.1", 0, "k", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 	client := newRawClient()
@@ -70,7 +70,7 @@ func TestCSRF_BlocksPlainPost(t *testing.T) {
 }
 
 func TestCSRF_GETUnaffected(t *testing.T) {
-	s := NewServer("127.0.0.1", 0, "k", "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
+	s := NewServer("127.0.0.1", 0, "k", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 	client := newRawClient()
@@ -88,7 +88,7 @@ func TestCSRF_GETUnaffected(t *testing.T) {
 }
 
 func TestCCSwitch_Config(t *testing.T) {
-	s := NewServer("127.0.0.1", 0, "k", "", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
+	s := NewServer("127.0.0.1", 0, "k", newFakeScheduler(), &fakeAggregator{}, &fakeCache{})
 	s.SetProxyConfig("http://127.0.0.1:9326", "my-proxy-key")
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()

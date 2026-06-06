@@ -10,9 +10,10 @@ func (a *responseAccumulator) estimatedOutputTokens() int {
 	return max(1, a.outputRuneCount/4)
 }
 
-// resolvedUsage returns the best available input and output token counts.
+// rawResolvedUsage returns the best available input and output token counts
+// before any optional local usage adjustment.
 // Priority: metadata/metering > pre-counted (tiktoken) > contextUsage estimate > 0.
-func (a *responseAccumulator) resolvedUsage() (inputTokens, outputTokens int) {
+func (a *responseAccumulator) rawResolvedUsage() (inputTokens, outputTokens int) {
 	if a.HasMetadata || a.InputTokens > 0 || a.OutputTokens > 0 {
 		return a.InputTokens, a.OutputTokens
 	}
@@ -29,12 +30,25 @@ func (a *responseAccumulator) resolvedUsage() (inputTokens, outputTokens int) {
 	return 0, 0
 }
 
+// resolvedUsage returns the final input/output token counts after any optional
+// usage adjustment has been applied.
+func (a *responseAccumulator) resolvedUsage() (inputTokens, outputTokens int) {
+	if a.FinalUsage != nil {
+		return a.FinalUsage.InputTokens, a.FinalUsage.OutputTokens
+	}
+	return a.rawResolvedUsage()
+}
+
 // UsageMap builds an Anthropic-compatible usage map from the given token counts.
 func (a *responseAccumulator) UsageMap(inputTokens, outputTokens int) map[string]any {
-	return map[string]any{
-		"input_tokens":                inputTokens,
-		"output_tokens":               outputTokens,
-		"cache_read_input_tokens":     a.CacheReadInputTokens,
-		"cache_creation_input_tokens": a.CacheWriteInputTokens,
+	usage := Usage{
+		InputTokens:           inputTokens,
+		OutputTokens:          outputTokens,
+		CacheReadInputTokens:  a.CacheReadInputTokens,
+		CacheWriteInputTokens: a.CacheWriteInputTokens,
 	}
+	if a.FinalUsage != nil {
+		usage = *a.FinalUsage
+	}
+	return usage.mapValue()
 }

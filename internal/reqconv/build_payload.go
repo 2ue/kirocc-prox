@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/google/uuid"
 	"github.com/niuma/kirocc-pro/internal/anthropic"
 	"github.com/niuma/kirocc-pro/internal/kiroproto"
 	"github.com/niuma/kirocc-pro/internal/toolsearch"
-	"github.com/google/uuid"
 )
 
 // defaultThinkingBudget is the default thinking token budget (medium).

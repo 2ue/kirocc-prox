@@ -2,24 +2,27 @@
 // kirocc-pro. Unlike `internal/config` which captures startup flags +
 // env vars (immutable for the process lifetime), this package owns
 // values that can change while the server is running — driven by the
-// admin UI and persisted to disk so they survive restarts.
+// admin UI and persisted to PostgreSQL so they survive restarts.
 //
-// Schema is JSON on disk; in-memory we keep a *Settings behind a
+// Schema is stored as JSONB; in-memory we keep a *Settings behind a
 // RWMutex. Access is goroutine-safe via Get/Update.
 //
-// Defaults match the project's flag defaults so a fresh user gets the
-// same behavior whether or not settings.json exists yet.
+// Defaults match the project's flag defaults so a fresh database gets the
+// same behavior whether or not a settings row exists yet.
 package settings
 
 import (
+	"database/sql"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/niuma/kirocc-pro/internal/promptcache"
 )
 
 // Settings is the persisted, runtime-mutable configuration.
@@ -47,6 +50,11 @@ type Settings struct {
 	// fixes — currently the thinking-budget floor + experimental
 	// thinking/system knobs.
 	Optimizations Optimizations `json:"optimizations"`
+
+	// PromptCacheReports maps proxy paths to local usage reporting profiles.
+	// New installs default to the built-in /v1 + /api/cc/ha/na profiles. An
+	// explicit empty object disables path/profile prompt-cache reporting.
+	PromptCacheReports promptcache.ReportConfig `json:"prompt_cache_reports"`
 
 	// schemaVersion guards against breaking format changes; bump when
 	// removing or repurposing fields.
@@ -85,31 +93,31 @@ type Optimizations struct {
 
 // RemoteManagement covers section 3.
 type RemoteManagement struct {
-	AllowRemote   bool   `json:"allow_remote"`
-	DisablePanel  bool   `json:"disable_panel"`
-	MgmtKey       string `json:"mgmt_key,omitempty"`
-	PanelRepoURL  string `json:"panel_repo_url,omitempty"`
+	AllowRemote  bool   `json:"allow_remote"`
+	DisablePanel bool   `json:"disable_panel"`
+	MgmtKey      string `json:"mgmt_key,omitempty"`
+	PanelRepoURL string `json:"panel_repo_url,omitempty"`
 }
 
 // APIKey is one entry in §4.
 type APIKey struct {
-	ID         string `json:"id"`                      // stable opaque id
-	Label      string `json:"label"`                   // human label "alice's laptop"
-	Key        string `json:"key"`                     // the actual secret
+	ID         string `json:"id"`    // stable opaque id
+	Label      string `json:"label"` // human label "alice's laptop"
+	Key        string `json:"key"`   // the actual secret
 	Enabled    bool   `json:"enabled"`
-	CreatedAt  int64  `json:"created_at"`              // unix seconds
-	ExpiresAt  int64  `json:"expires_at,omitempty"`    // unix seconds; 0 = never expires
-	QuotaLimit int64  `json:"quota_limit,omitempty"`   // total input+output tokens allowed; 0 = unlimited
-	UsedTokens int64  `json:"used_tokens,omitempty"`   // input+output tokens consumed so far
+	CreatedAt  int64  `json:"created_at"`            // unix seconds
+	ExpiresAt  int64  `json:"expires_at,omitempty"`  // unix seconds; 0 = never expires
+	QuotaLimit int64  `json:"quota_limit,omitempty"` // total input+output tokens allowed; 0 = unlimited
+	UsedTokens int64  `json:"used_tokens,omitempty"` // input+output tokens consumed so far
 }
 
 // System covers §5.
 type System struct {
-	Debug              bool `json:"debug"`
-	CommercialMode     bool `json:"commercial_mode"`
-	LoggingToFile      bool `json:"logging_to_file"`
-	UsageStatsEnabled  bool `json:"usage_stats_enabled"`
-	LogMaxTotalSizeMB  int  `json:"log_max_total_size_mb"`
+	Debug             bool `json:"debug"`
+	CommercialMode    bool `json:"commercial_mode"`
+	LoggingToFile     bool `json:"logging_to_file"`
+	UsageStatsEnabled bool `json:"usage_stats_enabled"`
+	LogMaxTotalSizeMB int  `json:"log_max_total_size_mb"`
 }
 
 // Network covers §6. Durations are stored as Go duration strings
@@ -128,7 +136,7 @@ type Network struct {
 	// PreferredRegion is the static fallback used by prefer-region
 	// routing when GeoIP is disabled or fails to resolve the client IP.
 	// Empty = no preference; selector uses RoutingStrategy alone.
-	PreferredRegion       string `json:"preferred_region,omitempty"`
+	PreferredRegion string `json:"preferred_region,omitempty"`
 }
 
 // MaxRetryInterval parses MaxRetryIntervalRaw, falling back to 30s.
@@ -198,29 +206,42 @@ func Default() *Settings {
 			BootstrapRetries:       1,
 			NonStreamingKeepaliveS: 0,
 		},
+		PromptCacheReports: promptcache.DefaultReportConfig().Normalized(),
 	}
 }
 
 // Store is the goroutine-safe in-memory + on-disk holder.
 type Store struct {
-	path string
-	mu   sync.RWMutex
-	cur  *Settings
+	path    string
+	backend settingsBackend
+	mu      sync.RWMutex
+	cur     *Settings
 }
 
-// New opens or creates a Store rooted at path. If the file does not
-// exist, defaults are written. If parsing fails, an error is returned
-// — callers should refuse to start in that case (don't silently nuke
-// the user's config).
-func New(path string) (*Store, error) {
-	if path == "" {
-		return nil, errors.New("settings: path required")
+type settingsBackend interface {
+	Load() ([]byte, error)
+	Save([]byte) error
+	Path() string
+}
+
+func NewPostgres(db *sql.DB) (*Store, error) {
+	if db == nil {
+		return nil, errors.New("settings: nil postgres db")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("settings: ensure dir: %w", err)
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS settings_docs (
+		key text PRIMARY KEY,
+		data jsonb NOT NULL,
+		updated_at timestamptz NOT NULL DEFAULT now()
+	)`); err != nil {
+		return nil, fmt.Errorf("settings: ensure postgres table: %w", err)
 	}
-	s := &Store{path: path}
-	if err := s.load(); err != nil {
+	return newWithBackend(&postgresSettingsBackend{db: db})
+}
+
+func newWithBackend(backend settingsBackend) (*Store, error) {
+	s := &Store{path: backend.Path(), backend: backend}
+	migrated, err := s.load()
+	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, err
 		}
@@ -228,6 +249,10 @@ func New(path string) (*Store, error) {
 		s.cur = Default()
 		if err := s.persistLocked(); err != nil {
 			return nil, fmt.Errorf("settings: write defaults: %w", err)
+		}
+	} else if migrated {
+		if err := s.persistLocked(); err != nil {
+			return nil, fmt.Errorf("settings: write migrated defaults: %w", err)
 		}
 	}
 	return s, nil
@@ -239,17 +264,19 @@ func (s *Store) Get() *Settings {
 	defer s.mu.RUnlock()
 	c := *s.cur
 	c.APIKeys = append([]APIKey(nil), s.cur.APIKeys...)
+	c.PromptCacheReports = s.cur.PromptCacheReports.Normalized()
 	return &c
 }
 
 // Update atomically applies fn to the current settings, persists the
-// result to disk, and on success returns the new value. fn must
+// result to PostgreSQL, and on success returns the new value. fn must
 // return non-nil; if it returns an error, the change is discarded.
 func (s *Store) Update(fn func(*Settings) error) (*Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	working := *s.cur
 	working.APIKeys = append([]APIKey(nil), s.cur.APIKeys...)
+	working.PromptCacheReports = s.cur.PromptCacheReports.Normalized()
 	if err := fn(&working); err != nil {
 		return nil, err
 	}
@@ -264,49 +291,84 @@ func (s *Store) Update(fn func(*Settings) error) (*Settings, error) {
 	return &out, nil
 }
 
-// Path returns the on-disk location.
+// Path returns the backend location.
 func (s *Store) Path() string { return s.path }
 
-// load reads + parses the file. Caller does not need to hold the lock
-// because load is only invoked from constructors.
-func (s *Store) load() error {
-	data, err := os.ReadFile(s.path)
+// load reads + parses the persisted settings. Caller does not need to hold the lock because
+// load is only invoked from constructors. It returns migrated=true when a
+// legacy settings document was upgraded and should be persisted again.
+func (s *Store) load() (migrated bool, err error) {
+	data, err := s.backend.Load()
 	if err != nil {
-		return err
+		return false, err
 	}
+	hasPromptCacheReports := hasPromptCacheReportsField(data)
 	var parsed Settings
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return fmt.Errorf("settings: parse %s: %w", s.path, err)
+		return false, fmt.Errorf("settings: parse %s: %w", s.path, err)
+	}
+	if !hasPromptCacheReports {
+		parsed.PromptCacheReports = promptcache.DefaultReportConfig().Normalized()
+		migrated = true
+	} else {
+		if err := parsed.PromptCacheReports.Validate(); err != nil {
+			return false, fmt.Errorf("settings: invalid prompt_cache_reports in %s: %w", s.path, err)
+		}
+		parsed.PromptCacheReports = parsed.PromptCacheReports.Normalized()
+	}
+	if err := parsed.PromptCacheReports.Validate(); err != nil {
+		return false, fmt.Errorf("settings: invalid prompt_cache_reports in %s: %w", s.path, err)
 	}
 	s.cur = &parsed
-	return nil
+	return migrated, nil
 }
 
-// persistLocked writes s.cur to disk atomically (write-rename).
+func hasPromptCacheReportsField(data []byte) bool {
+	var raw map[string]jsontext.Value
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return true
+	}
+	_, ok := raw["prompt_cache_reports"]
+	return ok
+}
+
+// persistLocked writes s.cur to the configured backend.
 // Caller must hold s.mu (any flavor).
 func (s *Store) persistLocked() error {
 	out, err := json.Marshal(s.cur)
 	if err != nil {
 		return fmt.Errorf("settings: marshal: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return fmt.Errorf("settings: write tmp: %w", err)
+	return s.backend.Save(out)
+}
+
+type postgresSettingsBackend struct {
+	db *sql.DB
+}
+
+func (b *postgresSettingsBackend) Load() ([]byte, error) {
+	var data []byte
+	err := b.db.QueryRow(`SELECT data FROM settings_docs WHERE key = 'default'`).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fs.ErrNotExist
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("settings: rename: %w", err)
+	if err != nil {
+		return nil, fmt.Errorf("settings: load postgres: %w", err)
+	}
+	return data, nil
+}
+
+func (b *postgresSettingsBackend) Save(data []byte) error {
+	_, err := b.db.Exec(`INSERT INTO settings_docs(key, data, updated_at)
+		VALUES ('default', $1::jsonb, now())
+		ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`, string(data))
+	if err != nil {
+		return fmt.Errorf("settings: save postgres: %w", err)
 	}
 	return nil
 }
 
-// DefaultSettingsPath returns ~/.config/kirocc/settings.json.
-func DefaultSettingsPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".config", "kirocc", "settings.json")
-}
+func (b *postgresSettingsBackend) Path() string { return "postgres://settings_docs/default" }
 
 // ApplyToEnv exports the optimization knobs to the process environment.
 // Only fills env vars that are currently unset, so explicit `KIROCC_*=...`

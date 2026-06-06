@@ -113,3 +113,87 @@ func TestLeastUsedSelector_Single(t *testing.T) {
 		t.Errorf("got %q want only", got.ID)
 	}
 }
+
+func TestLeastInFlightSelector_PicksMinInFlightInTopGroup(t *testing.T) {
+	ready := []*Credential{
+		mkCred("a", 100, 0),
+		mkCred("b", 100, 5),
+		mkCred("c", 50, 0),
+	}
+	ready[0].InFlight = 2
+	ready[1].InFlight = 1
+	ready[2].InFlight = 0
+
+	s := &LeastInFlightSelector{}
+	got, err := s.Pick(ready, "")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got.ID != "b" {
+		t.Errorf("got %q want b", got.ID)
+	}
+}
+
+func TestLeastInFlightSelector_TieBreaksBySuccess(t *testing.T) {
+	ready := []*Credential{
+		mkCred("a", 100, 5),
+		mkCred("b", 100, 2),
+	}
+	ready[0].InFlight = 1
+	ready[1].InFlight = 1
+
+	s := &LeastInFlightSelector{}
+	got, err := s.Pick(ready, "")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got.ID != "b" {
+		t.Errorf("got %q want b", got.ID)
+	}
+}
+
+func TestLeastInFlightSelector_Empty(t *testing.T) {
+	s := &LeastInFlightSelector{}
+	if _, err := s.Pick(nil, ""); !errors.Is(err, ErrNoReady) {
+		t.Errorf("expected ErrNoReady, got %v", err)
+	}
+}
+
+func TestWeightedLeastInFlightSelector_PicksLowestLoadRatio(t *testing.T) {
+	ready := []*Credential{
+		mkCred("a", 100, 0),
+		mkCred("b", 100, 0),
+		mkCred("c", 50, 0),
+	}
+	ready[0].MaxInFlight = 2
+	ready[0].InFlight = 1
+	ready[1].MaxInFlight = 8
+	ready[1].InFlight = 2
+	ready[2].MaxInFlight = 10
+	ready[2].InFlight = 0
+
+	s := &WeightedLeastInFlightSelector{}
+	got, err := s.Pick(ready, "")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got.ID != "b" {
+		t.Errorf("got %q want b", got.ID)
+	}
+}
+
+func TestWeightedLeastInFlightSelector_Empty(t *testing.T) {
+	s := &WeightedLeastInFlightSelector{}
+	if _, err := s.Pick(nil, ""); !errors.Is(err, ErrNoReady) {
+		t.Errorf("expected ErrNoReady, got %v", err)
+	}
+}
+
+func TestNewSelector_InFlightStrategies(t *testing.T) {
+	if _, ok := NewSelector("least-inflight").(*LeastInFlightSelector); !ok {
+		t.Fatalf("least-inflight did not create LeastInFlightSelector")
+	}
+	if _, ok := NewSelector("weighted-least-inflight").(*WeightedLeastInFlightSelector); !ok {
+		t.Fatalf("weighted-least-inflight did not create WeightedLeastInFlightSelector")
+	}
+}

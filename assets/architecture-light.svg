@@ -83,8 +83,8 @@
   <g transform="translate(760, 296)">
     <rect class="panel" width="320" height="72" rx="6"/>
     <text class="eyebrow muted" x="16" y="22">AUTH</text>
-    <text class="h2 ink" x="16" y="44">SQLite + Token Refresh</text>
-    <text class="mono muted" x="16" y="60">read creds · refresh on 403 · atomic write-back</text>
+    <text class="h2 ink" x="16" y="44">PostgreSQL + Token Refresh</text>
+    <text class="mono muted" x="16" y="60">load account · refresh on 403 · persist rotation</text>
   </g>
 
   <!-- Arrow handler ↔ auth -->

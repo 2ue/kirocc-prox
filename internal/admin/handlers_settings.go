@@ -7,12 +7,13 @@ import (
 	"net/url"
 	"strconv"
 
+	"github.com/niuma/kirocc-pro/internal/promptcache"
 	"github.com/niuma/kirocc-pro/internal/settings"
 )
 
-// settingsRequiredErr is returned by /admin/settings/* when no
-// settings store is wired (single-account legacy mode).
-var settingsRequiredErr = "admin: settings store not configured (start with -settings to enable)"
+// settingsRequiredErr is returned by /admin/settings/* when no PostgreSQL
+// settings store is wired.
+var settingsRequiredErr = "admin: settings store not configured"
 
 // serverInfoBlock is the server-side runtime view injected into GET
 // /admin/settings. These fields are read-only (set at startup via flags
@@ -26,7 +27,8 @@ type serverInfoBlock struct {
 	TLSEnabled    bool           `json:"tls_enabled"`
 	PublicBaseURL string         `json:"public_base_url,omitempty"`
 	ProxyBaseURL  string         `json:"proxy_base_url,omitempty"`
-	CredsPath     string         `json:"creds_path,omitempty"`
+	AccountStore  string         `json:"account_store"`
+	RuntimeStore  string         `json:"runtime_store"`
 	MultiAccount  bool           `json:"multi_account"`
 	GeoIP         geoIPInfoBlock `json:"geoip"`
 }
@@ -61,14 +63,15 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	// Using a map keeps the existing JSON shape for the settings sections
 	// and adds the new `server` block alongside.
 	resp := map[string]any{
-		"remote_management": cur.RemoteManagement,
-		"api_keys":          masked,
-		"system":            cur.System,
-		"network":           cur.Network,
-		"streaming":         cur.Streaming,
-		"optimizations":     cur.Optimizations,
-		"schema_version":    cur.SchemaVersion,
-		"server": s.buildServerInfo(),
+		"remote_management":    cur.RemoteManagement,
+		"api_keys":             masked,
+		"system":               cur.System,
+		"network":              cur.Network,
+		"streaming":            cur.Streaming,
+		"optimizations":        cur.Optimizations,
+		"prompt_cache_reports": cur.PromptCacheReports,
+		"schema_version":       cur.SchemaVersion,
+		"server":               s.buildServerInfo(),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -84,15 +87,22 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var patch struct {
-		RemoteManagement *settings.RemoteManagement `json:"remote_management,omitempty"`
-		System           *settings.System           `json:"system,omitempty"`
-		Network          *settings.Network          `json:"network,omitempty"`
-		Streaming        *settings.Streaming        `json:"streaming,omitempty"`
-		Optimizations    *settings.Optimizations    `json:"optimizations,omitempty"`
+		RemoteManagement   *settings.RemoteManagement `json:"remote_management,omitempty"`
+		System             *settings.System           `json:"system,omitempty"`
+		Network            *settings.Network          `json:"network,omitempty"`
+		Streaming          *settings.Streaming        `json:"streaming,omitempty"`
+		Optimizations      *settings.Optimizations    `json:"optimizations,omitempty"`
+		PromptCacheReports *promptcache.ReportConfig  `json:"prompt_cache_reports,omitempty"`
 	}
 	if err := json.UnmarshalRead(r.Body, &patch); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+	if patch.PromptCacheReports != nil {
+		if err := patch.PromptCacheReports.Validate(); err != nil {
+			http.Error(w, "invalid prompt_cache_reports: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	out, err := s.settings.Update(func(c *settings.Settings) error {
 		if patch.RemoteManagement != nil {
@@ -110,6 +120,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 		if patch.Optimizations != nil {
 			c.Optimizations = *patch.Optimizations
+		}
+		if patch.PromptCacheReports != nil {
+			c.PromptCacheReports = patch.PromptCacheReports.Normalized()
 		}
 		return nil
 	})
@@ -292,8 +305,9 @@ func (s *Server) buildServerInfo() serverInfoBlock {
 		TLSEnabled:    s.tlsCert != "" && s.tlsKey != "",
 		PublicBaseURL: s.publicBaseURL,
 		ProxyBaseURL:  s.proxyBaseURL,
-		CredsPath:     s.credsPath,
-		MultiAccount:  s.credsPath != "",
+		AccountStore:  "postgresql",
+		RuntimeStore:  "redis",
+		MultiAccount:  s.credStore != nil,
 		GeoIP:         geo,
 	}
 }

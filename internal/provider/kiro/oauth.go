@@ -222,11 +222,12 @@ func (p *Provider) CompleteOAuth(ctx context.Context, params url.Values, flow *p
 	}
 
 	cred := &pool.Credential{
-		ID:       id,
-		Label:    label,
-		Provider: ID,
-		Priority: 100,
-		ProxyURL: strings.TrimSpace(extras["proxy_url"]),
+		ID:          id,
+		Label:       label,
+		Provider:    ID,
+		Priority:    100,
+		MaxInFlight: pool.DefaultMaxInFlight,
+		ProxyURL:    strings.TrimSpace(extras["proxy_url"]),
 		Credentials: auth.Credentials{
 			AccessToken:  accessToken,
 			RefreshToken: refreshToken,
