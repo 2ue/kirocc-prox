@@ -23,31 +23,76 @@ docker build \
 GOEXPERIMENT=jsonv2
 ```
 
-## 本地运行完整服务
+## 部署运行完整服务
 
-默认 `docker-compose.yml` 会启动：
+`docker-compose.yml` 和 `docker-compose.deploy.yml` 都是远端镜像部署形态，会启动：
 
-- `kirocc-pro`: 代理和管理后台
-- `kirocc-pro-postgres`: PostgreSQL 持久化账号、设置、使用记录、配额快照
-- `kirocc-pro-redis`: Redis 运行时调度状态
+- `app`: 代理和管理后台
+- `postgres`: PostgreSQL 持久化账号、设置、使用记录、配额快照
+- `redis`: Redis 运行时调度状态
 
 ```bash
-docker compose up -d
+./scripts/init-deploy-env.sh .env.deploy
+docker compose --env-file .env.deploy -f docker-compose.deploy.yml up -d
 ```
 
-默认端口：
+脚本会自动生成以下部署变量：
+
+```text
+KIROCC_DEPLOY_PROJECT
+KIROCC_IMAGE
+KIROCC_VERSION
+KIROCC_PROXY_BIND
+KIROCC_PROXY_HOST_PORT
+KIROCC_ADMIN_BIND
+KIROCC_ADMIN_HOST_PORT
+KIROCC_DATA_DIR
+POSTGRES_DB
+POSTGRES_USER
+POSTGRES_PASSWORD
+KIROCC_POSTGRES_UID
+KIROCC_POSTGRES_GID
+REDIS_PASSWORD
+KIROCC_API_KEY
+KIROCC_ADMIN_KEY
+KIROCC_REDIS_KEY_PREFIX
+```
+
+默认宿主端口：
 
 ```text
 Proxy: http://127.0.0.1:9326
 Admin: http://127.0.0.1:3457
 ```
 
-建议生产环境至少设置：
+如果要对外开放，修改 `.env.deploy`：
+
+```text
+KIROCC_PROXY_BIND=0.0.0.0
+KIROCC_ADMIN_BIND=0.0.0.0
+KIROCC_ADMIN_PUBLIC_URL=https://your-admin.example.com
+```
+
+PostgreSQL 和 Redis 没有 `ports` 映射，只在 compose 内部网络可访问。数据持久化使用本地目录映射，默认：
+
+```text
+./deploy-data/postgres -> /var/lib/postgresql/data
+./deploy-data/redis    -> /data
+```
+
+没有使用 Docker named volumes；如果要迁移数据，直接迁移 `KIROCC_DATA_DIR` 指向的本地目录。
+初始化脚本会创建这些目录并设置为容器可写，同时把 `KIROCC_POSTGRES_UID` / `KIROCC_POSTGRES_GID` 自动填为当前宿主用户，避免 bind mount 在 Linux 或 Docker Desktop 下因为宿主目录所有者不匹配导致 Postgres 启动失败。
+
+为避免同机冲突，部署没有固定 `container_name`。Compose 会根据 `KIROCC_DEPLOY_PROJECT` 生成容器、网络和内部资源名；同一台机器部署多套时，改这个变量即可。
+
+常用部署命令：
 
 ```bash
-export POSTGRES_PASSWORD='change-me'
-export KIROCC_ADMIN_KEY='change-me'
-docker compose up -d
+docker compose --env-file .env.deploy -f docker-compose.deploy.yml pull
+docker compose --env-file .env.deploy -f docker-compose.deploy.yml up -d
+docker compose --env-file .env.deploy -f docker-compose.deploy.yml ps
+docker compose --env-file .env.deploy -f docker-compose.deploy.yml logs -f app
+docker compose --env-file .env.deploy -f docker-compose.deploy.yml down
 ```
 
 ## GitHub Actions 发布

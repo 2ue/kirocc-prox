@@ -20,7 +20,7 @@ func OpenPostgres(ctx context.Context, dsn string) (*sql.DB, error) {
 	db.SetMaxOpenConns(16)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxLifetime(30 * time.Minute)
-	if err := db.PingContext(ctx); err != nil {
+	if err := pingPostgresWithRetry(ctx, db, 30*time.Second); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
@@ -29,6 +29,35 @@ func OpenPostgres(ctx context.Context, dsn string) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+func pingPostgresWithRetry(ctx context.Context, db *sql.DB, maxWait time.Duration) error {
+	deadline := time.Now().Add(maxWait)
+	delay := 200 * time.Millisecond
+	var lastErr error
+	for {
+		if err := db.PingContext(ctx); err != nil {
+			lastErr = err
+		} else {
+			return nil
+		}
+		if maxWait <= 0 || time.Now().Add(delay).After(deadline) {
+			return lastErr
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if delay < 2*time.Second {
+			delay *= 2
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
+		}
+	}
 }
 
 func MigratePostgres(ctx context.Context, db *sql.DB) error {

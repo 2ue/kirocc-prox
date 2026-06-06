@@ -458,13 +458,25 @@ func collectKiroEnv() map[string]string {
 
 func redactKiroEnvValue(key, value string) string {
 	upper := strings.ToUpper(key)
+	if strings.Contains(upper, "DSN") {
+		return redactURLPassword(value)
+	}
 	if strings.Contains(upper, "API_KEY") ||
+		strings.Contains(upper, "ADMIN_KEY") ||
 		strings.Contains(upper, "TOKEN") ||
 		strings.Contains(upper, "SECRET") ||
 		strings.Contains(upper, "PASSWORD") {
 		return "<redacted>"
 	}
 	return value
+}
+
+func redactURLPassword(value string) string {
+	u, err := neturl.Parse(value)
+	if err != nil || u.User == nil {
+		return "<redacted>"
+	}
+	return u.Redacted()
 }
 
 func isLoopback(host string) bool {
