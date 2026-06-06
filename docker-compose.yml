@@ -1,0 +1,65 @@
+services:
+  kirocc-pro:
+    image: ${KIROCC_IMAGE:-ghcr.io/2ue/kirocc-prox}:${KIROCC_VERSION:-latest}
+    container_name: kirocc-pro
+    restart: unless-stopped
+    depends_on:
+      kirocc-pro-postgres:
+        condition: service_healthy
+      kirocc-pro-redis:
+        condition: service_healthy
+    environment:
+      KIROCC_HOST: 0.0.0.0
+      KIROCC_PORT: ${KIROCC_PORT:-9326}
+      KIROCC_ADMIN_HOST: 0.0.0.0
+      KIROCC_ADMIN_PORT: ${KIROCC_ADMIN_PORT:-3457}
+      KIROCC_ADMIN_KEY: ${KIROCC_ADMIN_KEY:-}
+      KIROCC_POOL_STRATEGY: ${KIROCC_POOL_STRATEGY:-least-inflight}
+      KIROCC_POSTGRES_DSN: postgres://${POSTGRES_USER:-kirocc}:${POSTGRES_PASSWORD:-kirocc_change_me}@kirocc-pro-postgres:5432/${POSTGRES_DB:-kirocc_pro}?sslmode=disable
+      KIROCC_REDIS_ADDR: kirocc-pro-redis:6379
+      KIROCC_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      KIROCC_REDIS_DB: ${KIROCC_REDIS_DB:-0}
+      KIROCC_REDIS_KEY_PREFIX: ${KIROCC_REDIS_KEY_PREFIX:-kirocc:prod:}
+      KIROCC_QUOTA_POLL_INTERVAL: ${KIROCC_QUOTA_POLL_INTERVAL:-3m}
+    ports:
+      - "${KIROCC_PORT:-9326}:${KIROCC_PORT:-9326}"
+      - "${KIROCC_ADMIN_PORT:-3457}:${KIROCC_ADMIN_PORT:-3457}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 3 -O- http://127.0.0.1:${KIROCC_PORT:-9326}/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  kirocc-pro-postgres:
+    image: postgres:16-alpine
+    container_name: kirocc-pro-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-kirocc_pro}
+      POSTGRES_USER: ${POSTGRES_USER:-kirocc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kirocc_change_me}
+    volumes:
+      - kirocc_pro_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kirocc} -d ${POSTGRES_DB:-kirocc_pro}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  kirocc-pro-redis:
+    image: redis:7-alpine
+    container_name: kirocc-pro-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - kirocc_pro_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  kirocc_pro_pg_data:
+  kirocc_pro_redis_data:

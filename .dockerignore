@@ -1,0 +1,45 @@
+# Version control and local runtime state
+.git/
+.github/
+.run/
+
+# Local editor / OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local config and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Build and test artifacts
+dist/
+coverage.*
+*.coverprofile
+*.test
+*.out
+debug.log
+_tmp/
+_docs/
+
+# Files not needed by the Go image build
+README*
+docs/
+examples/
+assets/
+web/
+docker-compose*.yml
+docker-compose*.yaml
+
+# Claude/Codex local state
+.claude/
+CLAUDE.md
+AGENTS.md
